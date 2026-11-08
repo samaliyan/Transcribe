@@ -536,14 +536,15 @@ class OutputsRecorder:
         return stop_all
 
     def capture_alive(self) -> bool:
-        """An output that stopped is dropped (the others go on); False only when none is left."""
-        alive = [member for member in self.members if member.capture_alive()]
-        if alive and len(alive) < len(self.members):
-            for member in self.members:
-                if member not in alive:
-                    print(f'[WARN] Output "{member.device_info.get("name")}" stopped; the others go on.')
-            self.members = alive
-        return bool(alive)
+        """False when the default output stopped (capture is then opened again). A stopped call
+        output is dropped and the default output goes on."""
+        if not self.members[0].capture_alive():
+            return False
+        for member in self.members[1:]:
+            if not member.capture_alive():
+                print(f'[WARN] Output "{member.device_info.get("name")}" stopped; the default output goes on.')
+        self.members = [self.members[0]] + [m for m in self.members[1:] if m.capture_alive()]
+        return True
 
     def wait_until_capturing(self, timeout: float = 3.0) -> bool:
         return self.members[0].wait_until_capturing(timeout)
@@ -557,19 +558,20 @@ class OutputsRecorder:
         self.members[0].set_device(index)
 
 
-def device_name(index: int) -> str:
-    """The name of a device by its current index."""
+def device_identity(index: int) -> tuple:
+    """(name, host API) of a device by its current index: what stays the same when indexes change."""
     with pyaudio.PyAudio() as p:
-        return p.get_device_info_by_index(index)["name"]
+        info = p.get_device_info_by_index(index)
+        return info["name"], info.get("hostApi")
 
 
-def device_index_by_name(name: str, host_api: int = None, want_input: bool = True):
-    """The current index of a device with this name (indexes change when devices come and go)."""
+def device_index_by_name(name: str, host_api: int = None):
+    """The current index of the device with this name and host API (None when not connected).
+    Matches microphones, outputs and their loopback devices alike."""
     with pyaudio.PyAudio() as p:
         for index in range(p.get_device_count()):
             info = p.get_device_info_by_index(index)
-            channels = info.get("maxInputChannels" if want_input else "maxOutputChannels", 0)
-            if info.get("name") == name and channels > 0 and (host_api is None or info.get("hostApi") == host_api):
+            if info.get("name") == name and (host_api is None or info.get("hostApi") == host_api):
                 return index
     return None
 

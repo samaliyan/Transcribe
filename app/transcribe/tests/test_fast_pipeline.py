@@ -1306,13 +1306,14 @@ class TestOutputs(unittest.TestCase):
         for member in members:
             member.stop_record_func.assert_called_once_with(wait_for_stop=False)
 
-    def test_an_output_that_stops_is_dropped_and_the_others_go_on(self):
+    def test_a_stopped_call_output_is_dropped_but_a_stopped_default_reopens_all(self):
         group, members = self.make(["Speakers", "Headphones"], call="Headphones")
         members[1].alive = False
         self.assertTrue(group.capture_alive())
         self.assertEqual(len(group.members), 1)
+        group, members = self.make(["Speakers", "Headphones"], call="Headphones")
         members[0].alive = False
-        self.assertFalse(group.capture_alive())
+        self.assertFalse(group.capture_alive())         # the watcher opens everything again
 
     def test_an_output_that_cannot_be_opened_is_skipped(self):
         group, _ = self.make(["Speakers", "Headphones"], broken=("Speakers",), call="Headphones")
@@ -1448,17 +1449,41 @@ class TestChosenDevices(unittest.TestCase):
         runtime = state.AppRuntime.__new__(state.AppRuntime)
         runtime._chosen_devices = {}
         recorder = MagicMock()
-        with patch.object(ar, "device_name", return_value="Headset Mic"):
-            runtime._use_chosen_device(recorder, "mic", 3, want_input=True)
+        with patch.object(ar, "device_identity", return_value=("Headset Mic", 13)):
+            runtime._use_chosen_device(recorder, "mic", 3)
         recorder.set_device.assert_called_with(index=3)
         with patch.object(ar, "device_index_by_name", return_value=7) as lookup:
-            runtime._use_chosen_device(recorder, "mic", 3, want_input=True)    # numbers moved
-        lookup.assert_called_with("Headset Mic", want_input=True)
+            runtime._use_chosen_device(recorder, "mic", 3)                     # numbers moved
+        lookup.assert_called_with("Headset Mic", 13)                           # same host API
         recorder.set_device.assert_called_with(index=7)
         recorder.reset_mock()
         with patch.object(ar, "device_index_by_name", return_value=None):
-            runtime._use_chosen_device(recorder, "mic", 3, want_input=True)    # unplugged
+            runtime._use_chosen_device(recorder, "mic", 3)                     # unplugged
         recorder.set_device.assert_not_called()
+
+    def test_lookup_by_name_finds_loopback_and_respects_the_host_api(self):
+        from sdk import audio_recorder as ar
+        devices = [{"name": "Speakers", "hostApi": 0, "maxInputChannels": 0},
+                   {"name": "Speakers", "hostApi": 13, "maxInputChannels": 0},
+                   {"name": "Speakers [Loopback]", "hostApi": 13, "maxInputChannels": 2, "maxOutputChannels": 0}]
+
+        class PyAudio:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def get_device_count(self):
+                return len(devices)
+
+            def get_device_info_by_index(self, index):
+                return devices[index]
+
+        with patch.object(ar, "pyaudio", SimpleNamespace(PyAudio=PyAudio)):
+            self.assertEqual(ar.device_index_by_name("Speakers", 13), 1)
+            self.assertEqual(ar.device_index_by_name("Speakers [Loopback]", 13), 2)
+            self.assertIsNone(ar.device_index_by_name("Headset", 13))
 
     def test_a_stand_in_device_counts_as_on(self):
         from sdk import audio_recorder as ar
