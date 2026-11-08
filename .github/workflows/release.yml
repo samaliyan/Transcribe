@@ -1,23 +1,33 @@
 name: Windows package
 
-# Every push to a branch other than main builds the package and tests it (nothing is published).
-# "Run workflow" on the Actions page builds it, tests it and publishes it as a release.
+# - A merge into main (a change to the program) builds, tests and publishes the next version by
+#   itself: 1.0.2 after 1.0.1. Changes to documentation only publish nothing.
+# - Every push to another branch builds and tests the package; nothing is published.
+# - "Run workflow" publishes a version number you choose (for example 1.1.0 or 2.0.0);
+#   left empty, it is the next one like a merge.
 on:
   push:
-    branches-ignore: [main]
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
   workflow_dispatch:
     inputs:
       version:
-        description: "Version number, e.g. 1.0.0"
-        required: true
+        description: "Version number, e.g. 1.1.0 (empty: the next one)"
+        required: false
 
 permissions:
   contents: write
+
+# Two merges close together are published one after the other, each with its own number.
+concurrency:
+  group: windows-package-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   package:
     runs-on: windows-latest
     timeout-minutes: 40
+    env:
+      PUBLISH: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -27,13 +37,21 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Check the version number
-        if: github.event_name == 'workflow_dispatch'
+      - name: Choose the version number
+        if: env.PUBLISH == 'true'
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
         run: |
+          git fetch --tags --force --quiet
           VERSION="${VERSION#v}"
+          if [ -z "$VERSION" ]; then
+            last=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+            last="${last#v}"; last="${last:-1.0.0}"
+            IFS=. read -r major minor patch <<< "$last"
+            VERSION="$major.$minor.$((patch + 1))"
+            [ -z "$(git tag -l 'v*')" ] && VERSION="1.0.0"
+          fi
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::The version must look like 1.0.0 (got '$VERSION')."; exit 1
           fi
@@ -128,7 +146,7 @@ jobs:
           retention-days: 14
 
       - name: Publish the release
-        if: github.event_name == 'workflow_dispatch'
+        if: env.PUBLISH == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
