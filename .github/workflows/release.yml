@@ -86,6 +86,7 @@ jobs:
           fi
 
       - name: Test the exe (help screen, then transcribe a sample file with the local engine)
+        timeout-minutes: 6
         shell: bash
         working-directory: dist/Transcribe
         run: |
@@ -100,6 +101,7 @@ jobs:
           rm -f help.txt run.txt sample.txt uid.lock
 
       - name: Test the exe (opens its window like a user would, also with Hugging Face unreachable)
+        timeout-minutes: 8
         shell: pwsh
         working-directory: dist/Transcribe
         run: |
