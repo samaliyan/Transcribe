@@ -24,9 +24,11 @@ unzip it and double-click `Transcribe.exe` (Windows 10/11, 64-bit). Nothing else
 The first start downloads the speech to text model once. To use an OpenAI API key, put it in `override.yaml`
 next to `Transcribe.exe`. A computer without a microphone or speaker device still starts; it uses the other source.
 
-To publish a new version (maintainers): Actions › Windows package › Run workflow, enter a version such as `1.0.1`.
-The package is built and tested on Windows (window start and a real transcription of a sample file) before it is
-published. Every push to a branch other than main builds and tests the package too, without publishing it.
+New versions (maintainers): every merge into main that changes the program publishes the next version by itself
+(1.0.2 after 1.0.1), after the package is built and tested on Windows (window start, start-up time, a real
+transcription of a sample file). Changes to documentation only publish nothing. For a bigger step (1.1.0, 2.0.0):
+Actions › Windows package › Run workflow, and enter the number. Every push to another branch builds and tests the
+package without publishing it.
 
 ## ⚡ Faster live pipeline (this fork)
 
