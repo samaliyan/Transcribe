@@ -1,6 +1,15 @@
+import os
 import sys
+import time
 import atexit
 from pathlib import Path
+
+_T0 = float(os.environ.get("TRANSCRIBE_T0") or time.time())
+
+
+def _mark(stage: str):
+    """Start-up timing, printed to the console (or logs/console.txt for the packaged program)."""
+    print(f"[START] {time.time() - _T0:6.1f} s  {stage}", flush=True)
 
 if __package__ in (None, ""):
     ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -27,6 +36,7 @@ from .desktop.runtime import (
 def main():
     """Primary method to run transcribe
     """
+    _mark("program code loaded")
     args = create_args()
 
     config = configuration.Config().data
@@ -37,11 +47,13 @@ def main():
         return
 
     initialize_desktop_runtime(runtime, config)
+    _mark("audio devices and speech to text ready to start")
 
     # Convert raw audio files to real wav file format when program exits
     atexit.register(shutdown, runtime)
 
     start_audio_capture(runtime)
+    _mark("audio capture started")
 
     # Initiate logging
     log_listener = al.initiate_log(config=config)
@@ -49,6 +61,7 @@ def main():
     controller = DesktopController(config=config, runtime=runtime)
     aui = AppUI(config=config, runtime=runtime, controller=controller)
     initiate_app_threads(runtime=runtime, config=config)
+    _mark("window built")
 
     print("READY")
 

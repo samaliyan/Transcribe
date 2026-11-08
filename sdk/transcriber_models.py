@@ -6,6 +6,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 import wave
 from enum import Enum
 from abc import abstractmethod
@@ -124,7 +125,8 @@ class STTModelFactory:
         if stt_model == STTEnum.WHISPER_LOCAL:
             # How do we get a different model for whisper, tiny vs base vs medium
             # Model value is derived from command line args
-            return WhisperSTTModel(stt_model_config=stt_model_config)
+            return WhisperSTTModel(stt_model_config=stt_model_config,
+                                   background=bool(stt_model_config.get("background")))
         elif stt_model == STTEnum.WHISPER_API:
             return APIWhisperSTTModel(stt_model_config=stt_model_config)
         elif stt_model == STTEnum.WHISPER_CPP:
@@ -355,7 +357,7 @@ class WhisperSTTModel(STTModelInterface):
     on a CPU, and it does not need PyTorch. openai-whisper is optional and used only when
     ``General.local_engine`` chooses it (or when it is the only engine installed).
     """
-    def __init__(self, stt_model_config: dict):
+    def __init__(self, stt_model_config: dict, background: bool = False):
         self.model = stt_model_config['local_transcripton_model_file']
         self.lang = stt_model_config['audio_lang']
         model_filename = MODELS_DIR + self.model + ".pt"
@@ -365,6 +367,27 @@ class WhisperSTTModel(STTModelInterface):
         self.use_gpu = False
         self.audio_model = None
         self._switch_lock = threading.Lock()
+        # faster-whisper runs two transcriptions at once (num_workers=2); openai-whisper cannot.
+        self.thread_safe = self.engine == FASTER_WHISPER
+        # "loading", "ready" or the reason it failed; the window shows it in its title.
+        self.load_state = "loading"
+        self._loaded = threading.Event()
+        if background:
+            # The window opens at once; the model (seconds, or a download the first time) loads meanwhile.
+            threading.Thread(target=self._load_in_background, name="LoadSpeechModel", daemon=True).start()
+        else:
+            self._load()
+
+    def _load_in_background(self):
+        try:
+            self._load()
+        except Exception as exception:  # pylint: disable=broad-except
+            self.load_state = str(exception)
+            self._loaded.set()
+            print(f'[ERROR] {exception}')
+
+    def _load(self):
+        started = time.monotonic()
         if self.engine == FASTER_WHISPER:
             try:
                 self.audio_model = self._load_faster_whisper()
@@ -394,10 +417,11 @@ class WhisperSTTModel(STTModelInterface):
             else:       # e.g. turbo: openai-whisper downloads it by name
                 utilities.ensure_directory_exists(MODELS_DIR)
                 self.audio_model = whisper.load_model(self.model, download_root=MODELS_DIR)
-        # faster-whisper runs two transcriptions at once (num_workers=2); openai-whisper cannot.
         self.thread_safe = self.engine == FASTER_WHISPER
+        self.load_state = "ready"
+        self._loaded.set()
         print(f'[INFO] Speech To Text - local Whisper ({self.engine}, model {self.model}), '
-              f'using GPU: {self.use_gpu}')
+              f'using GPU: {self.use_gpu}, loaded in {time.monotonic() - started:.1f} s')
 
     def _load_faster_whisper(self, allow_gpu: bool = True):
         # Hugging Face (where the model is downloaded from) otherwise prints notes about tokens
@@ -409,19 +433,30 @@ class WhisperSTTModel(STTModelInterface):
         from faster_whisper import WhisperModel  # pylint: disable=import-outside-toplevel
         download_root = os.path.join(MODELS_DIR, "faster-whisper")
         utilities.ensure_directory_exists(download_root)
+
+        def build(device, compute_type):
+            # A model that is already on disk is opened without asking Hugging Face first:
+            # that check went over the internet at every start and could take minutes where
+            # the site is slow or blocked. Only a missing model is downloaded.
+            try:
+                return WhisperModel(self.model, device=device, compute_type=compute_type,
+                                    download_root=download_root, num_workers=2, local_files_only=True)
+            except Exception:  # pylint: disable=broad-except
+                print(f'[INFO] Downloading the speech to text model "{self.model}" (first start only)...')
+                return WhisperModel(self.model, device=device, compute_type=compute_type,
+                                    download_root=download_root, num_workers=2)
+
         if allow_gpu:
             try:
                 import ctranslate2  # pylint: disable=import-outside-toplevel
                 if ctranslate2.get_cuda_device_count() > 0:
-                    model = WhisperModel(self.model, device="cuda", compute_type="float16",
-                                         download_root=download_root, num_workers=2)
+                    model = build("cuda", "float16")
                     self.use_gpu = True
                     self._gpu_model = model
                     return model
             except Exception as exception:  # pylint: disable=broad-except
                 print(f'[WARN] faster-whisper could not use the GPU ({exception}); using the CPU.')
-        model = WhisperModel(self.model, device="cpu", compute_type="int8",
-                             download_root=download_root, num_workers=2)
+        model = build("cpu", "int8")
         self.use_gpu = False
         return model
 
@@ -463,6 +498,9 @@ class WhisperSTTModel(STTModelInterface):
 
     def _transcribe(self, audio) -> dict:
         """Transcribe a file path or a 16 kHz float32 array into openai-whisper's result shape."""
+        self._loaded.wait()
+        if self.load_state != "ready":
+            raise RuntimeError(self.load_state)
         language = self.lang or None
         if self.engine == FASTER_WHISPER:
             model = self.audio_model

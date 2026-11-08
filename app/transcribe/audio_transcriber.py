@@ -80,7 +80,7 @@ class AudioTranscriber(TranscriberInterface):   # pylint: disable=C0115, R0902
         self._workers: dict[str, threading.Thread] = {}
         # Local engines (openai-whisper, SenseVoice, whisper.cpp) must not run two transcriptions at
         # once; network engines and faster-whisper (two workers) can.
-        self._model_lock = None if getattr(model, "thread_safe", False) else threading.Lock()
+        self._model_lock = threading.Lock()
         self.conversation = convo
 
     def _new_source_state(self) -> dict:
@@ -268,7 +268,8 @@ class AudioTranscriber(TranscriberInterface):   # pylint: disable=C0115, R0902
             return
 
         with duration.Duration(f'Transcription (Speech to Text) {who_spoke}', screen=False):
-            if self._model_lock is None:
+            # (asked each time: a local model loading in the background may still change engine)
+            if getattr(self.stt_model, "thread_safe", False):
                 response = self.stt_model.transcribe_pcm(pcm, audio_format.TARGET_SAMPLE_RATE)
             else:
                 with self._model_lock:

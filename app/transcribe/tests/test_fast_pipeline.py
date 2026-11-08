@@ -1076,3 +1076,86 @@ class TestMissingAudioDevices(unittest.TestCase):
         recorder.set_device.side_effect = OSError("gone")
         state.AppRuntime._use_device(recorder, 7)                  # does not raise
         recorder.set_device.assert_called_once_with(index=7)
+
+
+class TestFastStart(unittest.TestCase):
+    def fake_faster(self, cached=True, delay=0.0, fail=False):
+        calls = []
+
+        class FakeWhisperModel:
+            def __init__(self, name, **kwargs):
+                calls.append(kwargs.get("local_files_only", False))
+                if delay:
+                    time.sleep(delay)
+                if fail:
+                    raise OSError("connection timed out")
+                if kwargs.get("local_files_only") and not cached:
+                    raise OSError("not in the cache")
+
+            def transcribe(self, audio, **kwargs):
+                return iter([SimpleNamespace(start=0.0, end=1.0, text=" ok")]), SimpleNamespace(language="en")
+
+        fake = types.ModuleType("faster_whisper")
+        fake.WhisperModel = FakeWhisperModel
+        return fake, calls
+
+    def config(self):
+        return {"local_transcripton_model_file": "base", "audio_lang": "en", "local_engine": "faster-whisper"}
+
+    def test_a_downloaded_model_is_opened_without_going_online(self):
+        fake, calls = self.fake_faster(cached=True)
+        with patch.dict(sys.modules, {"faster_whisper": fake, "ctranslate2": None}):
+            tm.WhisperSTTModel(self.config())
+        self.assertEqual(calls, [True])
+
+    def test_a_missing_model_is_downloaded(self):
+        fake, calls = self.fake_faster(cached=False)
+        with patch.dict(sys.modules, {"faster_whisper": fake, "ctranslate2": None}):
+            model = tm.WhisperSTTModel(self.config())
+        self.assertEqual(calls, [True, False])
+        self.assertEqual(model.load_state, "ready")
+
+    def test_in_the_background_the_constructor_returns_at_once_and_transcription_waits(self):
+        fake, _ = self.fake_faster(delay=0.5)
+        with patch.dict(sys.modules, {"faster_whisper": fake, "ctranslate2": None}):
+            started = time.monotonic()
+            model = tm.WhisperSTTModel(self.config(), background=True)
+            self.assertLess(time.monotonic() - started, 0.2)
+            self.assertEqual(model.load_state, "loading")
+            result = model.transcribe_pcm(pcm(1))
+        self.assertEqual(result["text"], "ok")
+        self.assertEqual(model.load_state, "ready")
+
+    def test_a_failed_background_load_is_reported(self):
+        fake, _ = self.fake_faster(cached=False, fail=True)
+        with patch.dict(sys.modules, {"faster_whisper": fake, "ctranslate2": None}), \
+                patch.object(tm, "_installed", return_value=False):
+            model = tm.WhisperSTTModel(self.config(), background=True)
+            self.assertTrue(model._loaded.wait(3))
+            self.assertIn("internet", model.load_state)
+            self.assertEqual(model.transcribe_pcm(pcm(1)), "")
+
+    def test_the_live_transcriber_asks_for_a_background_load(self):
+        from app.transcribe.providers import stt
+        with patch.object(stt.tm.STTModelFactory, "get_stt_model_instance") as factory:
+            stt.create_stt_model("whisper", {"OpenAI": {"api_key": "", "local_transcripton_model_file": "base",
+                                                         "audio_lang": "English"}, "General": {}},
+                                 api=False, background=True)
+        self.assertTrue(factory.call_args.kwargs["stt_model_config"]["background"])
+
+    def test_window_title_follows_the_model(self):
+        from app.transcribe.appui import AppUI
+        ui = AppUI.__new__(AppUI)
+        model = SimpleNamespace(load_state="loading")
+        ui.global_vars = SimpleNamespace(transcriber=SimpleNamespace(stt_model=model))
+        titles, popups, timers = [], [], []
+        ui.title = titles.append
+        ui.after = lambda ms, fn: timers.append(fn)
+        ui.display_manager = SimpleNamespace(show_message_popup=lambda *a: popups.append(a))
+        ui.show_model_status()
+        model.load_state = "ready"
+        timers.pop()()
+        self.assertEqual(titles, ["Transcribe - loading the speech to text model...", "Transcribe"])
+        model.load_state = "no internet"
+        ui.show_model_status()
+        self.assertEqual(popups, [("Speech to text", "no internet")])
