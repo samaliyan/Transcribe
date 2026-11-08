@@ -46,7 +46,21 @@ class AppUI(ctk.CTk):
     def start(self):
         """Start showing the UI
         """
+        self.show_model_status()
         self.mainloop()
+
+    def show_model_status(self):
+        """While the local speech to text model loads (after the window is open), say so in the title."""
+        model = getattr(getattr(self.global_vars, "transcriber", None), "stt_model", None)
+        state = getattr(model, "load_state", "ready")
+        if state == "loading":
+            self.title("Transcribe - loading the speech to text model...")
+            self.after(500, self.show_model_status)
+        elif state == "ready":
+            self.title("Transcribe")
+        else:
+            self.title("Transcribe - the speech to text model could not be loaded")
+            self.display_manager.show_message_popup("Speech to text", state)
 
     def enqueue_ui_action(self, callback, *args, **kwargs):
         """Queue UI work for the Tk main loop."""

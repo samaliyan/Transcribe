@@ -9,6 +9,9 @@ output goes to that prompt, or to the file it is redirected to.
 """
 import os
 import sys
+import time
+
+os.environ.setdefault("TRANSCRIBE_T0", str(time.time()))     # start-up timings count from here
 
 STD_OUTPUT_HANDLE = -11
 STD_ERROR_HANDLE = -12

@@ -36,8 +36,11 @@ def ensure_ffmpeg_available():
         raise SystemExit(1)
 
 
-def create_stt_model(name: str, config: dict, api: bool):
-    """Create the STT model instance for the selected provider."""
+def create_stt_model(name: str, config: dict, api: bool, background: bool = False):
+    """Create the STT model instance for the selected provider.
+
+    background=True (the desktop window): a local model loads while the window is already open.
+    """
     model_factory = tm.STTModelFactory()
 
     if name.lower() == "deepgram":
@@ -80,6 +83,7 @@ def create_stt_model(name: str, config: dict, api: bool):
             "local_transcripton_model_file": config["OpenAI"]["local_transcripton_model_file"],
             "audio_lang": get_language_code(config["OpenAI"]["audio_lang"]),
             "local_engine": config["General"].get("local_engine", "auto"),
+            "background": background,
         }
         return model_factory.get_stt_model_instance(
             stt_model=tm.STTEnum.WHISPER_LOCAL,
@@ -113,7 +117,7 @@ def create_transcriber(name: str, config: dict, api: bool, runtime):
         runtime.set_transcriber(transcriber)
         return transcriber
 
-    model = create_stt_model(name=name, config=config, api=api)
+    model = create_stt_model(name=name, config=config, api=api, background=True)
 
     if name.lower() == "deepgram":
         transcriber = DeepgramTranscriber(
