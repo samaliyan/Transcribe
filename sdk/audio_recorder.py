@@ -97,7 +97,7 @@ class BaseRecorder:
     """Base class for Speaker, Microphone classes
     """
 
-    def __init__(self, source, source_name, audio_file_name: str = None):
+    def __init__(self, source, source_name, audio_file_name: str = None, keep_audio_file: bool = False):
         logger.info(BaseRecorder.__name__)
         self.recorder = sr.Recognizer()
         self.recorder.energy_threshold = ENERGY_THRESHOLD
@@ -115,7 +115,8 @@ class BaseRecorder:
         self.audio_file_name = audio_file_name
         # (sample_rate, sample_width, channels) of the data written to audio_file_name.
         self._saved_format = None
-        self._remove_existing_audio_files()
+        if not keep_audio_file:         # (kept when capture is reopened after a device change)
+            self._remove_existing_audio_files()
 
     def _remove_existing_audio_files(self):
         """Remove existing audio files if they exist"""
@@ -278,7 +279,9 @@ class UnavailableRecorder:
     def __init__(self, source_name: str, reason: str):
         self.source_name = source_name
         self.reason = reason
-        self.enabled = False
+        # "On" like a real device: no audio comes anyway, and a device that appears later and
+        # replaces this stand-in takes over the on/off choice.
+        self.enabled = True
         self.available = False
         self.stop_record_func = None
         self.device_index = None
@@ -318,11 +321,12 @@ def open_recorder(recorder_class, source_name: str, **kwargs):
 class MicRecorder(BaseRecorder):
     """Encapsultes the Microphone device audio input
     """
-    def __init__(self, source_name='You', audio_file_name: str = None):
+    def __init__(self, source_name='You', audio_file_name: str = None, keep_audio_file: bool = False):
         self.source = sr.Microphone(sample_rate=16000)
         self.device_index = self.source.device_index
         self.device_info = None
-        super().__init__(source=self.source, source_name=source_name, audio_file_name=audio_file_name)
+        super().__init__(source=self.source, source_name=source_name, audio_file_name=audio_file_name,
+                         keep_audio_file=keep_audio_file)
         self.adjust_for_noise("Default Mic", "Please make some noise from the Default Mic...")
 
 #    def __init__(self):
@@ -386,13 +390,14 @@ def loopback_source(device: dict):
 class SpeakerRecorder(BaseRecorder):
     """Encapsultes the Speaer device audio input
     """
-    def __init__(self, source_name='Speaker', audio_file_name: str = None, device: dict = None):
+    def __init__(self, source_name='Speaker', audio_file_name: str = None, device: dict = None,
+                 keep_audio_file: bool = False):
         logger.info(SpeakerRecorder.__name__)
-        if device is not None:          # one given output device (see AllOutputsRecorder)
+        if device is not None:          # one given output device (see OutputsRecorder)
             self.device_index = device["index"]
             self.device_info = device
             super().__init__(source=loopback_source(device), source_name=source_name,
-                             audio_file_name=audio_file_name)
+                             audio_file_name=audio_file_name, keep_audio_file=keep_audio_file)
             print(f'[INFO] Listening to sound from Speaker: {self.get_name()} ')
             return
         with pyaudio.PyAudio() as p:
@@ -451,26 +456,42 @@ class SpeakerRecorder(BaseRecorder):
         #                       f"Please play sound from selected Speakers {self.get_name()}...")
 
 
-class AllOutputsRecorder:
-    """What every output device plays: speakers, headphones, a Bluetooth headset in either of its
-    modes, HDMI... A meeting can play its sound on any of them (often not the default one), so
-    all are captured; an output that plays nothing gives nothing. The default output comes first."""
+class OutputsRecorder:
+    """What the speakers play: the default output and, when it is a different one, the output
+    Windows uses for calls (for example a Bluetooth headset in hands-free mode, which meeting
+    apps play to). Other outputs are left alone: virtual devices that copy the sound to a real
+    output would otherwise give every sentence twice. The default output comes first."""
 
-    def __init__(self, source_name='Speaker', audio_file_name: str = None, only_default: bool = False):
+    def __init__(self, source_name='Speaker', audio_file_name: str = None, only_default: bool = False,
+                 keep_audio_file: bool = False, call_output_name=None):
+        if call_output_name is None:
+            from sdk.audio_devices import windows_call_output_name  # pylint: disable=import-outside-toplevel
+            call_output_name = windows_call_output_name
         with pyaudio.PyAudio() as p:
             wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)
             default_name = p.get_device_info_by_index(wasapi["defaultOutputDevice"])["name"]
-            devices = list(p.get_loopback_device_info_generator())
-        devices.sort(key=lambda d: 0 if default_name in d["name"] else 1)
-        if only_default:
-            devices = devices[:1]
+            loopbacks = list(p.get_loopback_device_info_generator())
+        wanted = [default_name]
+        call_name = None if only_default else call_output_name()
+        if call_name:
+            wanted.append(call_name)
+        devices = []
+        for name in wanted:
+            for device in loopbacks:
+                # (Windows gives call device names cut to 31 characters)
+                if device["name"].lower().startswith(name.lower()) and device not in devices:
+                    devices.append(device)
+                    break
+        if not devices and loopbacks:
+            devices = loopbacks[:1]
         self.source_name = source_name
         self.members = []
         for device in devices:
             try:
                 first = not self.members
                 self.members.append(SpeakerRecorder(source_name=source_name, device=device,
-                                                    audio_file_name=audio_file_name if first else None))
+                                                    audio_file_name=audio_file_name if first else None,
+                                                    keep_audio_file=keep_audio_file))
             except Exception as exception:  # pylint: disable=broad-except
                 print(f'[WARN] Output "{device.get("name")}" cannot be captured: {exception}')
         if not self.members:
@@ -515,7 +536,14 @@ class AllOutputsRecorder:
         return stop_all
 
     def capture_alive(self) -> bool:
-        return all(member.capture_alive() for member in self.members)
+        """An output that stopped is dropped (the others go on); False only when none is left."""
+        alive = [member for member in self.members if member.capture_alive()]
+        if alive and len(alive) < len(self.members):
+            for member in self.members:
+                if member not in alive:
+                    print(f'[WARN] Output "{member.device_info.get("name")}" stopped; the others go on.')
+            self.members = alive
+        return bool(alive)
 
     def wait_until_capturing(self, timeout: float = 3.0) -> bool:
         return self.members[0].wait_until_capturing(timeout)
@@ -524,9 +552,26 @@ class AllOutputsRecorder:
         return self.members[0].write_wav_data_to_file()
 
     def set_device(self, index: int):
-        """A chosen output instead of all of them."""
+        """A chosen output instead of the default and call outputs."""
         self.members = self.members[:1]
         self.members[0].set_device(index)
+
+
+def device_name(index: int) -> str:
+    """The name of a device by its current index."""
+    with pyaudio.PyAudio() as p:
+        return p.get_device_info_by_index(index)["name"]
+
+
+def device_index_by_name(name: str, host_api: int = None, want_input: bool = True):
+    """The current index of a device with this name (indexes change when devices come and go)."""
+    with pyaudio.PyAudio() as p:
+        for index in range(p.get_device_count()):
+            info = p.get_device_info_by_index(index)
+            channels = info.get("maxInputChannels" if want_input else "maxOutputChannels", 0)
+            if info.get("name") == name and channels > 0 and (host_api is None or info.get("hostApi") == host_api):
+                return index
+    return None
 
 
 if __name__ == "__main__":

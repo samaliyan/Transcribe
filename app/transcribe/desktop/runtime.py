@@ -62,7 +62,7 @@ def start_audio_capture(runtime, config: dict = None):
 
         runtime.device_watcher = AudioDeviceWatcher(
             runtime, runtime.audio_queue,
-            open_devices=lambda: runtime.open_audio_devices(config),
+            open_devices=lambda: runtime.open_audio_devices(config, reopen=True),
             on_change=sources_changed)
         runtime.device_watcher.start()
 

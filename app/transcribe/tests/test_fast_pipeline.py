@@ -1037,7 +1037,7 @@ class TestMissingAudioDevices(unittest.TestCase):
 
         recorder = ar.open_recorder(Broken, "You", audio_file_name="x.wav")
         self.assertIsInstance(recorder, ar.UnavailableRecorder)
-        self.assertFalse(recorder.enabled)
+        self.assertTrue(recorder.enabled)        # (no audio comes; a real device later takes over "on")
         self.assertIn("could not be opened", recorder.reason)
         stop = recorder.record_audio(None)
         stop(wait_for_stop=True)
@@ -1064,7 +1064,7 @@ class TestMissingAudioDevices(unittest.TestCase):
         runtime = state.create_app_runtime()
         config = {"General": {"disable_mic": False, "mic_device_index": 3,
                               "disable_speaker": False, "speaker_device_index": -1}}
-        with patch.object(ar, "MicRecorder", broken_mic), patch.object(ar, "AllOutputsRecorder", GoodSpeaker), \
+        with patch.object(ar, "MicRecorder", broken_mic), patch.object(ar, "OutputsRecorder", GoodSpeaker), \
                 patch.object(state.utilities, "get_data_path", return_value="."):
             runtime.initiate_audio_devices(config)
         self.assertIsInstance(runtime.user_audio_recorder, ar.UnavailableRecorder)
@@ -1189,6 +1189,17 @@ class TestDeviceStreams(unittest.TestCase):
         started = time.monotonic()
         self.assertEqual(stream.read(100), bytes(400))
         self.assertLess(time.monotonic() - started, 1.0)
+        started = time.monotonic()
+        for _ in range(5):                                  # then at about the pace of real audio
+            stream.read(100)
+        self.assertLess(time.monotonic() - started, 0.9)
+
+    def test_audio_that_is_only_late_is_not_replaced_by_silence(self):
+        stream = self.stream(speaker=True)
+        stream.callback(b"\x01" * 400, 100, None, 0)
+        stream.read(100)
+        threading.Timer(0.15, lambda: stream.callback(b"\x02" * 400, 100, None, 0)).start()
+        self.assertEqual(stream.read(100), b"\x02" * 400)
 
     def test_a_microphone_that_stops_sending_ends_the_read(self):
         stream = self.stream(speaker=False)
@@ -1241,17 +1252,18 @@ def fake_pyaudio(outputs, default_index=0):
     return module
 
 
-class TestAllOutputs(unittest.TestCase):
-    def make(self, outputs, default_index=0, broken=(), only_default=False):
+class TestOutputs(unittest.TestCase):
+    def make(self, outputs, default_index=0, broken=(), only_default=False, call=None):
         from sdk import audio_recorder as ar
         made = []
 
         class Member:
-            def __init__(self, source_name, device, audio_file_name):
+            def __init__(self, source_name, device, audio_file_name, keep_audio_file=False):
                 if device["name"].split(" [")[0] in broken:
                     raise OSError("in use")
                 self.device_info, self.audio_file_name = device, audio_file_name
-                self.enabled, self.stop_record_func, self.started = True, None, 0
+                self.keep = keep_audio_file
+                self.enabled, self.stop_record_func, self.started, self.alive = True, None, 0, True
                 self.source = SimpleNamespace(name=device["name"])
                 made.append(self)
 
@@ -1262,21 +1274,30 @@ class TestAllOutputs(unittest.TestCase):
                 return stopper
 
             def capture_alive(self):
-                return True
+                return self.alive
 
         with patch.object(ar, "pyaudio", fake_pyaudio(outputs, default_index)), \
                 patch.object(ar, "SpeakerRecorder", Member):
-            return ar.AllOutputsRecorder(audio_file_name="s.wav", only_default=only_default), made
+            return ar.OutputsRecorder(audio_file_name="s.wav", only_default=only_default,
+                                      call_output_name=lambda: call), made
 
-    def test_every_output_is_captured_with_the_default_first(self):
-        group, members = self.make(["Speakers", "Headset Hands-Free", "HDMI"], default_index=1)
+    def test_the_default_and_the_call_output_are_captured(self):
+        # Windows gives the call device name cut to 31 characters
+        group, members = self.make(["Speakers (Realtek(R) Audio)", "Headset (WH-1000XM4 Hands-Free AG Audio)", "HDMI"],
+                                   default_index=0, call="Headset (WH-1000XM4 Hands-Free ")
         self.assertEqual([m.device_info["name"] for m in group.members],
-                         ["Headset Hands-Free [Loopback]", "Speakers [Loopback]", "HDMI [Loopback]"])
-        self.assertEqual([m.audio_file_name for m in members], ["s.wav", None, None])
-        self.assertEqual(group.source.name, "Headset Hands-Free [Loopback]")
+                         ["Speakers (Realtek(R) Audio) [Loopback]",
+                          "Headset (WH-1000XM4 Hands-Free AG Audio) [Loopback]"])
+        self.assertEqual([m.audio_file_name for m in members], ["s.wav", None])
+
+    def test_one_output_when_the_call_output_is_the_default_or_unknown(self):
+        group, _ = self.make(["Speakers", "HDMI"], call="Speakers")
+        self.assertEqual(len(group.members), 1)
+        group, _ = self.make(["Speakers", "HDMI"], default_index=1, call=None)
+        self.assertEqual([m.device_info["name"] for m in group.members], ["HDMI [Loopback]"])
 
     def test_on_off_and_start_stop_apply_to_all(self):
-        group, members = self.make(["Speakers", "Headphones"])
+        group, members = self.make(["Speakers", "Headphones"], call="Headphones")
         group.enabled = False
         self.assertEqual([m.enabled for m in members], [False, False])
         stop = group.record_audio(None)
@@ -1284,17 +1305,24 @@ class TestAllOutputs(unittest.TestCase):
         stop(wait_for_stop=True)
         for member in members:
             member.stop_record_func.assert_called_once_with(wait_for_stop=False)
+
+    def test_an_output_that_stops_is_dropped_and_the_others_go_on(self):
+        group, members = self.make(["Speakers", "Headphones"], call="Headphones")
+        members[1].alive = False
         self.assertTrue(group.capture_alive())
+        self.assertEqual(len(group.members), 1)
+        members[0].alive = False
+        self.assertFalse(group.capture_alive())
 
     def test_an_output_that_cannot_be_opened_is_skipped(self):
-        group, _ = self.make(["Speakers", "Headphones"], broken=("Speakers",))
+        group, _ = self.make(["Speakers", "Headphones"], broken=("Speakers",), call="Headphones")
         self.assertEqual([m.device_info["name"] for m in group.members], ["Headphones [Loopback]"])
         with self.assertRaises(OSError):
             self.make(["Speakers"], broken=("Speakers",))
 
-    def test_one_output_when_asked(self):
-        group, _ = self.make(["Speakers", "Headphones"], default_index=1, only_default=True)
-        self.assertEqual(len(group.members), 1)
+    def test_only_the_default_when_asked(self):
+        group, _ = self.make(["Speakers", "Headphones"], default_index=1, only_default=True, call="Speakers")
+        self.assertEqual([m.device_info["name"] for m in group.members], ["Headphones [Loopback]"])
 
 
 class Rec:
@@ -1368,6 +1396,29 @@ class TestDeviceWatcher(unittest.TestCase):
         self.assertTrue(wait_for(lambda: len(opened) == 1, 3))
         watcher.stop()
 
+    def test_a_device_that_keeps_failing_is_retried_less_and_less_often(self):
+        watcher, runtime, opened, _ = self.make([(1, 1)], speaker=Rec("old speakers", alive=False))
+        original = watcher.open_devices
+        watcher.open_devices = lambda: (lambda pair: (pair[0], Rec("dead", alive=False)))(original())
+        watcher.start()
+        time.sleep(1.6)
+        watcher.stop()
+        # min_gap 0.2 s doubling: about 0.2, 0.6, 1.4 s -> 3 tries, not 8
+        self.assertLessEqual(len(opened), 4)
+
+    def test_stop_waits_for_a_restart_under_way_and_nothing_opens_after(self):
+        watcher, runtime, opened, _ = self.make([(1, 1)])
+        gate = threading.Event()
+        original = watcher.open_devices
+        watcher.open_devices = lambda: (gate.wait(2), original())[1]
+        threading.Thread(target=watcher.restart, args=("test",), daemon=True).start()
+        time.sleep(0.1)
+        threading.Timer(0.3, gate.set).start()
+        watcher.stop()                                     # returns only after that restart
+        self.assertEqual(len(opened), 1)
+        watcher.restart("after stop")
+        self.assertEqual(len(opened), 1)
+
     def test_nothing_happens_while_nothing_changes(self):
         watcher, _, opened, _ = self.make([(1, 1)], mic=Rec("none", alive=False, available=False))
         watcher.start()
@@ -1388,3 +1439,27 @@ class TestDeviceWatcher(unittest.TestCase):
                 patch("threading.Thread.start"):
             stopper = recognizer.listen_in_background(source, "x", lambda *a: None)
         self.assertTrue(hasattr(stopper, "thread"))
+
+
+class TestChosenDevices(unittest.TestCase):
+    def test_a_chosen_device_is_found_again_by_name_after_numbers_change(self):
+        from sdk import audio_recorder as ar
+        from app.transcribe.core import state
+        runtime = state.AppRuntime.__new__(state.AppRuntime)
+        runtime._chosen_devices = {}
+        recorder = MagicMock()
+        with patch.object(ar, "device_name", return_value="Headset Mic"):
+            runtime._use_chosen_device(recorder, "mic", 3, want_input=True)
+        recorder.set_device.assert_called_with(index=3)
+        with patch.object(ar, "device_index_by_name", return_value=7) as lookup:
+            runtime._use_chosen_device(recorder, "mic", 3, want_input=True)    # numbers moved
+        lookup.assert_called_with("Headset Mic", want_input=True)
+        recorder.set_device.assert_called_with(index=7)
+        recorder.reset_mock()
+        with patch.object(ar, "device_index_by_name", return_value=None):
+            runtime._use_chosen_device(recorder, "mic", 3, want_input=True)    # unplugged
+        recorder.set_device.assert_not_called()
+
+    def test_a_stand_in_device_counts_as_on(self):
+        from sdk import audio_recorder as ar
+        self.assertTrue(ar.UnavailableRecorder("You", "none").enabled)

@@ -23,7 +23,7 @@ class AppRuntime:
 
     audio_queue: queue.Queue = None
     user_audio_recorder: ar.MicRecorder = None
-    speaker_audio_recorder: ar.AllOutputsRecorder = None
+    speaker_audio_recorder: ar.OutputsRecorder = None
     device_watcher = None
     audio_player_var: "AudioPlayer" = None
     transcriber: "TranscriberInterface" = None
@@ -45,6 +45,7 @@ class AppRuntime:
         if self._initialized:
             return
 
+        self._chosen_devices = {}       # devices chosen in the settings, by name
         if self.audio_queue is None:
             self.audio_queue = queue.Queue()
 
@@ -87,31 +88,48 @@ class AppRuntime:
         """Initialize the active microphone and speaker devices."""
         self.user_audio_recorder, self.speaker_audio_recorder = self.open_audio_devices(config)
 
-    def open_audio_devices(self, config: dict):
+    def open_audio_devices(self, config: dict, reopen: bool = False):
         """Open the microphone and the speakers as they are now (also after a device change).
 
         A missing microphone or speaker (or one that fails to open) does not stop the program:
-        it continues with the other source.
+        it continues with the other source. A device chosen by number in the settings is
+        remembered by its name, because numbers change when devices come and go.
         """
         general = config["General"]
         data_dir = utilities.get_data_path(app_name="Transcribe")
         print("[INFO] Using default microphone.")
-        mic = ar.open_recorder(ar.MicRecorder, "You", audio_file_name=f"{data_dir}/logs/mic.wav")
+        mic = ar.open_recorder(ar.MicRecorder, "You", audio_file_name=f"{data_dir}/logs/mic.wav",
+                               keep_audio_file=reopen)
         if getattr(mic, "available", True) and not general["disable_mic"] and general["mic_device_index"] != -1:
             print("[INFO] Override default microphone with device specified in parameters file.")
-            self._use_device(mic, int(general["mic_device_index"]))
+            self._use_chosen_device(mic, "mic", int(general["mic_device_index"]), want_input=True)
 
-        # Every output is captured (a meeting may play on any of them). A device chosen in the
-        # settings, or the realtime engine (one audio format per source), uses one output.
         fixed = not general["disable_speaker"] and general["speaker_device_index"] != -1
         one_output = fixed or str(general.get("stt", "")).lower() == "openai-realtime"
-        print("[INFO] Using default speaker." if one_output else "[INFO] Listening to all outputs.")
-        speaker = ar.open_recorder(ar.AllOutputsRecorder, "Speaker",
-                                   audio_file_name=f"{data_dir}/logs/speaker.wav", only_default=one_output)
+        print("[INFO] Using default speaker.")
+        speaker = ar.open_recorder(ar.OutputsRecorder, "Speaker", audio_file_name=f"{data_dir}/logs/speaker.wav",
+                                   only_default=one_output, keep_audio_file=reopen)
         if getattr(speaker, "available", True) and fixed:
             print("[INFO] Override default speaker with device specified in parameters file.")
-            self._use_device(speaker, int(general["speaker_device_index"]))
+            self._use_chosen_device(speaker, "speaker", int(general["speaker_device_index"]), want_input=False)
         return mic, speaker
+
+    def _use_chosen_device(self, recorder, kind: str, configured_index: int, want_input: bool):
+        """Use the device chosen in the settings: by its number the first time, by its name after."""
+        chosen = self._chosen_devices.get(kind)
+        try:
+            if chosen is None:
+                self._chosen_devices[kind] = ar.device_name(configured_index)
+                index = configured_index
+            else:
+                index = ar.device_index_by_name(chosen, want_input=want_input)
+                if index is None:
+                    print(f'[WARN] "{chosen}" is not connected; using the default device.')
+                    return
+        except Exception as exception:  # pylint: disable=broad-except
+            print(f"[WARN] Device {configured_index} could not be used ({exception}); keeping the default device.")
+            return
+        self._use_device(recorder, index)
 
     @staticmethod
     def _use_device(recorder, index: int):

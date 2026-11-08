@@ -265,6 +265,9 @@ class Microphone(AudioSource):
         # means the device was unplugged or stopped: reading then fails, so the listener ends
         # and the device watcher can open the current device again.
         MIC_SILENT_LIMIT = 3.0
+        # An output that sends nothing for this long is playing nothing: reads give silence then.
+        # (Shorter gaps are just late audio, which must not be replaced by zeros.)
+        OUTPUT_QUIET_AFTER = 0.25
 
         def __init__(self, pyaudio_stream=None, frame_bytes=2, sample_rate=16000, speaker=False):
             self.pyaudio_stream = pyaudio_stream
@@ -282,7 +285,8 @@ class Microphone(AudioSource):
 
         def read(self, size):
             wanted = size * self.frame_bytes
-            wait = max(0.05, 2.0 * size / self.sample_rate)
+            # one block of audio time per wait, so silence comes at about the pace of real audio
+            wait = max(0.01, size / self.sample_rate)
             while len(self._pending) < wanted:
                 try:
                     self._pending += self._chunks.get(timeout=wait)
@@ -290,9 +294,10 @@ class Microphone(AudioSource):
                 except queue.Empty:
                     if self.pyaudio_stream is not None and not self.pyaudio_stream.is_active():
                         raise OSError("the audio device stopped")
-                    if not self.speaker and time.monotonic() - self._last_data > self.MIC_SILENT_LIMIT:
+                    quiet = time.monotonic() - self._last_data
+                    if not self.speaker and quiet > self.MIC_SILENT_LIMIT:
                         raise OSError("the microphone stopped sending audio")
-                    if self.speaker:
+                    if self.speaker and quiet >= self.OUTPUT_QUIET_AFTER:
                         # nothing is playing on this output: that is silence
                         self._pending += bytes(wanted - len(self._pending))
             data = bytes(self._pending[:wanted])

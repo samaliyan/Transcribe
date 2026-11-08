@@ -48,6 +48,34 @@ def windows_audio_signature():
         return None
 
 
+def windows_call_output_name():
+    """The name of the output Windows uses for calls ("Default Communication Device"),
+    as Windows gives it (cut to 31 characters). None when it cannot be read."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes  # pylint: disable=import-outside-toplevel
+        from ctypes import wintypes  # pylint: disable=import-outside-toplevel
+
+        class WaveOutCaps(ctypes.Structure):  # WAVEOUTCAPSW
+            _fields_ = [("wMid", wintypes.WORD), ("wPid", wintypes.WORD),
+                        ("vDriverVersion", wintypes.UINT), ("szPname", wintypes.WCHAR * 32),
+                        ("dwFormats", wintypes.DWORD), ("wChannels", wintypes.WORD),
+                        ("wReserved1", wintypes.WORD), ("dwSupport", wintypes.DWORD)]
+
+        winmm = ctypes.windll.winmm
+        device, flags = wintypes.DWORD(0xFFFFFFFF), wintypes.DWORD(0)
+        if winmm.waveOutMessage(ctypes.c_void_p(WAVE_MAPPER), DRVM_MAPPER_CONSOLEVOICECOM_GET,
+                                ctypes.byref(device), ctypes.byref(flags)) != 0 or device.value == 0xFFFFFFFF:
+            return None
+        caps = WaveOutCaps()
+        if winmm.waveOutGetDevCapsW(ctypes.c_size_t(device.value), ctypes.byref(caps), ctypes.sizeof(caps)) != 0:
+            return None
+        return caps.szPname or None
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
 class AudioDeviceWatcher:
     """Restarts capture when the devices change or a capture stops by itself.
 
@@ -64,6 +92,7 @@ class AudioDeviceWatcher:
         self.signature = signature
         self.interval = interval
         self.min_gap = min_gap
+        self._gap = min_gap             # grows while a device keeps failing right after a restart
         self.restarts = 0
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -75,7 +104,10 @@ class AudioDeviceWatcher:
         self._thread.start()
 
     def stop(self):
+        """Stop watching; waits for a restart that is under way, so nothing opens after this."""
         self._stop.set()
+        with self._lock:
+            pass
 
     def _recorders(self):
         return [self.runtime.user_audio_recorder, self.runtime.speaker_audio_recorder]
@@ -99,8 +131,11 @@ class AudioDeviceWatcher:
                             break
                         settled = current
                     known = current
+                    self._gap = self.min_gap
                     self.restart("the audio devices changed")
-                elif self._capture_ended() and time.monotonic() - self._last_restart >= self.min_gap:
+                elif self._capture_ended() and time.monotonic() - self._last_restart >= self._gap:
+                    # (if it keeps failing, try less and less often: at most once a minute)
+                    self._gap = min(self._gap * 2, 60.0)
                     self.restart("an audio device stopped")
                     known = self.signature()
             except Exception as exception:  # pylint: disable=broad-except
@@ -109,6 +144,8 @@ class AudioDeviceWatcher:
     def restart(self, reason: str):
         """Stop all capture, open the current devices and start again (keeps on/off choices)."""
         with self._lock:
+            if self._stop.is_set():
+                return
             self._last_restart = time.monotonic()
             self.restarts += 1
             print(f"[INFO] {reason}: opening the current microphone and speakers again.")
