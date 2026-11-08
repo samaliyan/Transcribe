@@ -29,6 +29,7 @@ import aifc
 import math
 import audioop
 import collections
+import queue
 import json
 import base64
 import threading
@@ -218,31 +219,23 @@ class Microphone(AudioSource):
     def __enter__(self):
         assert self.stream is None, "This audio source is already inside a context manager"
         self.audio = self.pyaudio_module.PyAudio()
-
+        channels = self.channels if self.speaker else 1
+        stream = Microphone.MicrophoneStream(frame_bytes=self.SAMPLE_WIDTH * channels,
+                                             sample_rate=self.SAMPLE_RATE, speaker=self.speaker)
         try:
-            if self.speaker:
-                p = self.audio
-                self.stream = Microphone.MicrophoneStream(
-                    p.open(
-                        input_device_index=self.device_index,
-                        channels=self.channels,
-                        format=self.format,
-                        rate=self.SAMPLE_RATE,
-                        frames_per_buffer=self.CHUNK,
-                        input=True
-                    )
-                )
-            else:
-                self.stream = Microphone.MicrophoneStream(
-                    self.audio.open(
-                        input_device_index=self.device_index,
-                        channels=1,
-                        format=self.format,
-                        rate=self.SAMPLE_RATE,
-                        frames_per_buffer=self.CHUNK,
-                        input=True,
-                    )
-                )
+            # Callback mode: the device hands over audio as it comes. A loopback device that has
+            # nothing to play sends nothing; reads then return silence instead of blocking for
+            # ever, so the listener can always be stopped (and restarted on another device).
+            stream.pyaudio_stream = self.audio.open(
+                input_device_index=self.device_index,
+                channels=channels,
+                format=self.format,
+                rate=self.SAMPLE_RATE,
+                frames_per_buffer=self.CHUNK,
+                input=True,
+                stream_callback=stream.callback,
+            )
+            self.stream = stream
         except Exception as e:
             # This exception often goes unseen since this method is implicitly
             # called for the with clause of Microphone and can go unnoticed
@@ -253,22 +246,58 @@ class Microphone(AudioSource):
 
     def __exit__(self, exc_type, exc_value, traceback):
         try:
-            self.stream.close()
+            if self.stream is not None:
+                self.stream.close()
         except Exception as e:
             # This exception often goes unseen since this method is implicitly
             # called for the with clause of Microphone and can go unnoticed
             print('Encountered exception in Microphone __exit__')
             print(e)
         finally:
+            if self.stream is not None:
+                self.audio.terminate()
             self.stream = None
-            self.audio.terminate()
 
     class MicrophoneStream(object):
-        def __init__(self, pyaudio_stream):
+        """Audio from a device stream in callback mode, read in blocks of frames."""
+
+        # A microphone delivers audio all the time, even when it is quiet. Nothing for this long
+        # means the device was unplugged or stopped: reading then fails, so the listener ends
+        # and the device watcher can open the current device again.
+        MIC_SILENT_LIMIT = 3.0
+
+        def __init__(self, pyaudio_stream=None, frame_bytes=2, sample_rate=16000, speaker=False):
             self.pyaudio_stream = pyaudio_stream
+            self.frame_bytes = frame_bytes
+            self.sample_rate = sample_rate
+            self.speaker = speaker
+            self._chunks = queue.Queue()
+            self._pending = bytearray()
+            self._last_data = time.monotonic()
+
+        def callback(self, in_data, frame_count, time_info, status):  # pylint: disable=unused-argument
+            if in_data:
+                self._chunks.put(in_data)
+            return (None, 0)        # 0 = paContinue
 
         def read(self, size):
-            return self.pyaudio_stream.read(size, exception_on_overflow=False)
+            wanted = size * self.frame_bytes
+            wait = max(0.05, 2.0 * size / self.sample_rate)
+            while len(self._pending) < wanted:
+                try:
+                    self._pending += self._chunks.get(timeout=wait)
+                    self._last_data = time.monotonic()
+                except queue.Empty:
+                    if self.pyaudio_stream is not None and not self.pyaudio_stream.is_active():
+                        raise OSError("the audio device stopped")
+                    if not self.speaker and time.monotonic() - self._last_data > self.MIC_SILENT_LIMIT:
+                        raise OSError("the microphone stopped sending audio")
+                    if self.speaker:
+                        # nothing is playing on this output: that is silence
+                        self._pending += bytes(wanted - len(self._pending))
+            data = bytes(self._pending[:wanted])
+            del self._pending[:wanted]
+            return data
 
         def close(self):
             try:
@@ -688,6 +717,7 @@ class Recognizer(AudioSource):
         listener_thread = threading.Thread(target=threaded_listen, name=source_name+' Thread')
         listener_thread.daemon = True
         listener_thread.start()
+        stopper.thread = listener_thread      # lets the device watcher see a listener that ended
         return stopper
 
     def recognize_sphinx(self, audio_data, language="en-US", keyword_entries=None, grammar=None, show_all=False):

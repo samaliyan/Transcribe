@@ -23,7 +23,8 @@ class AppRuntime:
 
     audio_queue: queue.Queue = None
     user_audio_recorder: ar.MicRecorder = None
-    speaker_audio_recorder: ar.SpeakerRecorder = None
+    speaker_audio_recorder: ar.AllOutputsRecorder = None
+    device_watcher = None
     audio_player_var: "AudioPlayer" = None
     transcriber: "TranscriberInterface" = None
     responder = None
@@ -84,24 +85,33 @@ class AppRuntime:
 
     def initiate_audio_devices(self, config: dict):
         """Initialize the active microphone and speaker devices."""
-        print("[INFO] Using default microphone.")
-        data_dir = utilities.get_data_path(app_name="Transcribe")
-        # A missing microphone or speaker (or one that fails to open) no longer stops the program:
-        # it continues with the other source.
-        self.user_audio_recorder = ar.open_recorder(ar.MicRecorder, "You",
-                                                    audio_file_name=f"{data_dir}/logs/mic.wav")
-        if (getattr(self.user_audio_recorder, "available", True) and not config["General"]["disable_mic"]
-                and config["General"]["mic_device_index"] != -1):
-            print("[INFO] Override default microphone with device specified in parameters file.")
-            self._use_device(self.user_audio_recorder, int(config["General"]["mic_device_index"]))
+        self.user_audio_recorder, self.speaker_audio_recorder = self.open_audio_devices(config)
 
-        print("[INFO] Using default speaker.")
-        self.speaker_audio_recorder = ar.open_recorder(ar.SpeakerRecorder, "Speaker",
-                                                       audio_file_name=f"{data_dir}/logs/speaker.wav")
-        if (getattr(self.speaker_audio_recorder, "available", True) and not config["General"]["disable_speaker"]
-                and config["General"]["speaker_device_index"] != -1):
+    def open_audio_devices(self, config: dict):
+        """Open the microphone and the speakers as they are now (also after a device change).
+
+        A missing microphone or speaker (or one that fails to open) does not stop the program:
+        it continues with the other source.
+        """
+        general = config["General"]
+        data_dir = utilities.get_data_path(app_name="Transcribe")
+        print("[INFO] Using default microphone.")
+        mic = ar.open_recorder(ar.MicRecorder, "You", audio_file_name=f"{data_dir}/logs/mic.wav")
+        if getattr(mic, "available", True) and not general["disable_mic"] and general["mic_device_index"] != -1:
+            print("[INFO] Override default microphone with device specified in parameters file.")
+            self._use_device(mic, int(general["mic_device_index"]))
+
+        # Every output is captured (a meeting may play on any of them). A device chosen in the
+        # settings, or the realtime engine (one audio format per source), uses one output.
+        fixed = not general["disable_speaker"] and general["speaker_device_index"] != -1
+        one_output = fixed or str(general.get("stt", "")).lower() == "openai-realtime"
+        print("[INFO] Using default speaker." if one_output else "[INFO] Listening to all outputs.")
+        speaker = ar.open_recorder(ar.AllOutputsRecorder, "Speaker",
+                                   audio_file_name=f"{data_dir}/logs/speaker.wav", only_default=one_output)
+        if getattr(speaker, "available", True) and fixed:
             print("[INFO] Override default speaker with device specified in parameters file.")
-            self._use_device(self.speaker_audio_recorder, int(config["General"]["speaker_device_index"]))
+            self._use_device(speaker, int(general["speaker_device_index"]))
+        return mic, speaker
 
     @staticmethod
     def _use_device(recorder, index: int):

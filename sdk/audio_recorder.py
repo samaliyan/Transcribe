@@ -179,6 +179,11 @@ class BaseRecorder:
                                                        phrase_time_limit=self.config['General']['transcript_audio_duration_seconds'])
         return stop_func
 
+    def capture_alive(self) -> bool:
+        """False when capture was started and its thread has ended (device unplugged or failed)."""
+        thread = getattr(self.stop_record_func, "thread", None)
+        return thread is None or thread.is_alive()
+
     def wait_until_capturing(self, timeout: float = 3.0) -> bool:
         """Block until the capture thread has opened its audio stream (or the timeout passes)."""
         deadline = time.monotonic() + timeout
@@ -222,6 +227,8 @@ class BaseRecorder:
             stop_event.set()
             if wait_for_stop and capture_thread.is_alive():
                 capture_thread.join(timeout=2)
+
+        stop_capture.thread = capture_thread
 
         return stop_capture
 
@@ -365,11 +372,29 @@ class MicRecorder(BaseRecorder):
         self.adjust_for_noise("Mic", "Please make some noise from the chosen Mic...")
 
 
+def loopback_source(device: dict):
+    """A capture source for what an output device plays (WASAPI loopback)."""
+    # 1024 frames per read. It was pyaudio.get_sample_size(paInt16) = 2 frames, which made the
+    # listener run its Python loop about 24,000 times a second for 48 kHz audio.
+    return sr.Microphone(speaker=True,
+                         device_index=device["index"],
+                         sample_rate=int(device["defaultSampleRate"]),
+                         chunk_size=1024,
+                         channels=device["maxInputChannels"])
+
+
 class SpeakerRecorder(BaseRecorder):
     """Encapsultes the Speaer device audio input
     """
-    def __init__(self, source_name='Speaker', audio_file_name: str = None):
+    def __init__(self, source_name='Speaker', audio_file_name: str = None, device: dict = None):
         logger.info(SpeakerRecorder.__name__)
+        if device is not None:          # one given output device (see AllOutputsRecorder)
+            self.device_index = device["index"]
+            self.device_info = device
+            super().__init__(source=loopback_source(device), source_name=source_name,
+                             audio_file_name=audio_file_name)
+            print(f'[INFO] Listening to sound from Speaker: {self.get_name()} ')
+            return
         with pyaudio.PyAudio() as p:
             wasapi_inf = p.get_host_api_info_by_type(pyaudio.paWASAPI)
             self.device_index = wasapi_inf["defaultOutputDevice"]
@@ -385,11 +410,7 @@ class SpeakerRecorder(BaseRecorder):
 
         self.device_info = default_speakers
 
-        source = sr.Microphone(speaker=True,
-                               device_index=default_speakers["index"],
-                               sample_rate=int(default_speakers["defaultSampleRate"]),
-                               chunk_size=pyaudio.get_sample_size(pyaudio.paInt16),
-                               channels=default_speakers["maxInputChannels"])
+        source = loopback_source(default_speakers)
         super().__init__(source=source, source_name=source_name, audio_file_name=audio_file_name)
         print(f'[INFO] Listening to sound from Speaker: {self.get_name()} ')
         # On some devices, speaker adjustment is very slow unless some noise is
@@ -423,15 +444,89 @@ class SpeakerRecorder(BaseRecorder):
             self.stop_record_func = None
 
         self.device_info = speakers
-        self.source = sr.Microphone(speaker=True,
-                                    device_index=speakers["index"],
-                                    sample_rate=int(speakers["defaultSampleRate"]),
-                                    chunk_size=pyaudio.get_sample_size(pyaudio.paInt16),
-                                    channels=speakers["maxInputChannels"])
+        self.source = loopback_source(speakers)
 
         print(f'[INFO] Listening to sound from Speaker: {self.get_name()}')
         # self.adjust_for_noise("Speaker",
         #                       f"Please play sound from selected Speakers {self.get_name()}...")
+
+
+class AllOutputsRecorder:
+    """What every output device plays: speakers, headphones, a Bluetooth headset in either of its
+    modes, HDMI... A meeting can play its sound on any of them (often not the default one), so
+    all are captured; an output that plays nothing gives nothing. The default output comes first."""
+
+    def __init__(self, source_name='Speaker', audio_file_name: str = None, only_default: bool = False):
+        with pyaudio.PyAudio() as p:
+            wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+            default_name = p.get_device_info_by_index(wasapi["defaultOutputDevice"])["name"]
+            devices = list(p.get_loopback_device_info_generator())
+        devices.sort(key=lambda d: 0 if default_name in d["name"] else 1)
+        if only_default:
+            devices = devices[:1]
+        self.source_name = source_name
+        self.members = []
+        for device in devices:
+            try:
+                first = not self.members
+                self.members.append(SpeakerRecorder(source_name=source_name, device=device,
+                                                    audio_file_name=audio_file_name if first else None))
+            except Exception as exception:  # pylint: disable=broad-except
+                print(f'[WARN] Output "{device.get("name")}" cannot be captured: {exception}')
+        if not self.members:
+            raise OSError("no output device can be captured")
+        self._enabled = True
+        self.stop_record_func = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, value: bool):
+        self._enabled = bool(value)
+        for member in self.members:
+            member.enabled = self._enabled
+
+    @property
+    def source(self):
+        return self.members[0].source
+
+    @property
+    def device_info(self):
+        return self.members[0].device_info
+
+    def get_name(self):
+        return ", ".join(member.device_info["name"] for member in self.members)
+
+    def record_audio(self, audio_queue):
+        for member in self.members:
+            member.stop_record_func = member.record_audio(audio_queue)
+
+        def stop_all(wait_for_stop=True):
+            for member in self.members:
+                if member.stop_record_func is not None:
+                    member.stop_record_func(wait_for_stop=False)
+            if wait_for_stop:
+                for member in self.members:
+                    thread = getattr(member.stop_record_func, "thread", None)
+                    if thread is not None:
+                        thread.join(timeout=6)
+        return stop_all
+
+    def capture_alive(self) -> bool:
+        return all(member.capture_alive() for member in self.members)
+
+    def wait_until_capturing(self, timeout: float = 3.0) -> bool:
+        return self.members[0].wait_until_capturing(timeout)
+
+    def write_wav_data_to_file(self):
+        return self.members[0].write_wav_data_to_file()
+
+    def set_device(self, index: int):
+        """A chosen output instead of all of them."""
+        self.members = self.members[:1]
+        self.members[0].set_device(index)
 
 
 if __name__ == "__main__":

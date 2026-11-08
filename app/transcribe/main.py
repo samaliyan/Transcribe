@@ -52,7 +52,7 @@ def main():
     # Convert raw audio files to real wav file format when program exits
     atexit.register(shutdown, runtime)
 
-    start_audio_capture(runtime)
+    start_audio_capture(runtime, config)
     _mark("audio capture started")
 
     # Initiate logging
