@@ -10,6 +10,7 @@ from ..audio_player import AudioPlayer
 from ..db.app_db import AppDB
 from ..providers.llm import create_responder
 from ..providers.stt import create_transcriber
+from sdk.audio_devices import AudioDeviceWatcher
 
 from tsutils import utilities
 
@@ -45,8 +46,8 @@ def initialize_desktop_runtime(runtime, config: dict):
     )
 
 
-def start_audio_capture(runtime):
-    """Start microphone and speaker capture threads."""
+def start_audio_capture(runtime, config: dict = None):
+    """Start microphone and speaker capture threads, and follow device changes from then on."""
     user_stop_func = runtime.user_audio_recorder.record_audio(runtime.audio_queue)
     runtime.user_audio_recorder.stop_record_func = user_stop_func
     # Open the two devices one after the other (some drivers fail when both open at once),
@@ -54,6 +55,16 @@ def start_audio_capture(runtime):
     runtime.user_audio_recorder.wait_until_capturing(timeout=2.0)
     speaker_stop_func = runtime.speaker_audio_recorder.record_audio(runtime.audio_queue)
     runtime.speaker_audio_recorder.stop_record_func = speaker_stop_func
+
+    if config is not None:
+        def sources_changed(mic, speaker):
+            runtime.transcriber.set_source_properties(mic_source=mic.source, speaker_source=speaker.source)
+
+        runtime.device_watcher = AudioDeviceWatcher(
+            runtime, runtime.audio_queue,
+            open_devices=lambda: runtime.open_audio_devices(config, reopen=True),
+            on_change=sources_changed)
+        runtime.device_watcher.start()
 
 
 def initiate_app_threads(runtime, config: dict):
@@ -135,6 +146,8 @@ def shutdown(runtime):
     """Activities to be performed right before application shutdown."""
     if runtime.transcriber is not None:
         runtime.transcriber.stop()
+    if runtime.device_watcher is not None:
+        runtime.device_watcher.stop()
     for recorder in (runtime.user_audio_recorder, runtime.speaker_audio_recorder):
         if recorder is not None and recorder.stop_record_func is not None:
             recorder.stop_record_func(wait_for_stop=True)

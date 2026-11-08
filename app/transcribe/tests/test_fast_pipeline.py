@@ -1037,7 +1037,7 @@ class TestMissingAudioDevices(unittest.TestCase):
 
         recorder = ar.open_recorder(Broken, "You", audio_file_name="x.wav")
         self.assertIsInstance(recorder, ar.UnavailableRecorder)
-        self.assertFalse(recorder.enabled)
+        self.assertTrue(recorder.enabled)        # (no audio comes; a real device later takes over "on")
         self.assertIn("could not be opened", recorder.reason)
         stop = recorder.record_audio(None)
         stop(wait_for_stop=True)
@@ -1064,7 +1064,7 @@ class TestMissingAudioDevices(unittest.TestCase):
         runtime = state.create_app_runtime()
         config = {"General": {"disable_mic": False, "mic_device_index": 3,
                               "disable_speaker": False, "speaker_device_index": -1}}
-        with patch.object(ar, "MicRecorder", broken_mic), patch.object(ar, "SpeakerRecorder", GoodSpeaker), \
+        with patch.object(ar, "MicRecorder", broken_mic), patch.object(ar, "OutputsRecorder", GoodSpeaker), \
                 patch.object(state.utilities, "get_data_path", return_value="."):
             runtime.initiate_audio_devices(config)
         self.assertIsInstance(runtime.user_audio_recorder, ar.UnavailableRecorder)
@@ -1159,3 +1159,332 @@ class TestFastStart(unittest.TestCase):
         model.load_state = "no internet"
         ui.show_model_status()
         self.assertEqual(popups, [("Speech to text", "no internet")])
+
+
+
+class FakeStream:
+    def __init__(self, active=True):
+        self.active = active
+
+    def is_active(self):
+        return self.active
+
+
+class TestDeviceStreams(unittest.TestCase):
+    def stream(self, speaker, active=True):
+        import custom_speech_recognition as csr
+        stream = csr.Microphone.MicrophoneStream(frame_bytes=4, sample_rate=1000, speaker=speaker)
+        stream.pyaudio_stream = FakeStream(active)
+        return stream
+
+    def test_blocks_of_frames_are_put_together_from_the_callback(self):
+        stream = self.stream(speaker=False)
+        stream.callback(b"\x01" * 12, 3, None, 0)
+        stream.callback(b"\x02" * 20, 5, None, 0)
+        self.assertEqual(stream.read(4), b"\x01" * 12 + b"\x02" * 4)
+        self.assertEqual(stream.read(4), b"\x02" * 16)
+
+    def test_a_silent_output_gives_silence_instead_of_blocking(self):
+        stream = self.stream(speaker=True)
+        started = time.monotonic()
+        self.assertEqual(stream.read(100), bytes(400))
+        self.assertLess(time.monotonic() - started, 1.0)
+        started = time.monotonic()
+        for _ in range(5):                                  # then at about the pace of real audio
+            stream.read(100)
+        self.assertLess(time.monotonic() - started, 0.9)
+
+    def test_audio_that_is_only_late_is_not_replaced_by_silence(self):
+        stream = self.stream(speaker=True)
+        stream.callback(b"\x01" * 400, 100, None, 0)
+        stream.read(100)
+        threading.Timer(0.15, lambda: stream.callback(b"\x02" * 400, 100, None, 0)).start()
+        self.assertEqual(stream.read(100), b"\x02" * 400)
+
+    def test_a_microphone_that_stops_sending_ends_the_read(self):
+        stream = self.stream(speaker=False)
+        stream.MIC_SILENT_LIMIT = 0.3
+        with self.assertRaises(OSError):
+            stream.read(100)
+
+    def test_a_stream_that_stopped_ends_the_read(self):
+        stream = self.stream(speaker=True, active=False)
+        with self.assertRaises(OSError):
+            stream.read(100)
+
+    def test_the_listener_can_be_stopped_while_nothing_plays(self):
+        import custom_speech_recognition as csr
+        stream = self.stream(speaker=True)
+        stream.sample_rate = 16000
+        source = csr.Microphone.__new__(csr.Microphone)
+        source.stream, source.CHUNK, source.SAMPLE_RATE, source.SAMPLE_WIDTH = stream, 1024, 16000, 2
+        source.__enter__ = None
+        recognizer = csr.Recognizer()
+        recognizer.energy_threshold = 1000
+        started = time.monotonic()
+        with self.assertRaises(csr.WaitTimeoutError):
+            recognizer.listen(source, timeout=0.5)
+        self.assertLess(time.monotonic() - started, 3.0)
+
+
+def fake_pyaudio(outputs, default_index=0):
+    module = types.SimpleNamespace(paWASAPI=13)
+
+    class PyAudio:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get_host_api_info_by_type(self, kind):
+            return {"defaultOutputDevice": default_index}
+
+        def get_device_info_by_index(self, index):
+            return {"name": outputs[index]}
+
+        def get_loopback_device_info_generator(self):
+            for index, name in enumerate(outputs):
+                yield {"index": 100 + index, "name": f"{name} [Loopback]", "defaultSampleRate": 48000,
+                       "maxInputChannels": 2}
+
+    module.PyAudio = PyAudio
+    return module
+
+
+class TestOutputs(unittest.TestCase):
+    def make(self, outputs, default_index=0, broken=(), only_default=False, call=None):
+        from sdk import audio_recorder as ar
+        made = []
+
+        class Member:
+            def __init__(self, source_name, device, audio_file_name, keep_audio_file=False):
+                if device["name"].split(" [")[0] in broken:
+                    raise OSError("in use")
+                self.device_info, self.audio_file_name = device, audio_file_name
+                self.keep = keep_audio_file
+                self.enabled, self.stop_record_func, self.started, self.alive = True, None, 0, True
+                self.source = SimpleNamespace(name=device["name"])
+                made.append(self)
+
+            def record_audio(self, audio_queue):
+                self.started += 1
+                stopper = MagicMock()
+                stopper.thread = SimpleNamespace(is_alive=lambda: True, join=lambda timeout: None)
+                return stopper
+
+            def capture_alive(self):
+                return self.alive
+
+        with patch.object(ar, "pyaudio", fake_pyaudio(outputs, default_index)), \
+                patch.object(ar, "SpeakerRecorder", Member):
+            return ar.OutputsRecorder(audio_file_name="s.wav", only_default=only_default,
+                                      call_output_name=lambda: call), made
+
+    def test_the_default_and_the_call_output_are_captured(self):
+        # Windows gives the call device name cut to 31 characters
+        group, members = self.make(["Speakers (Realtek(R) Audio)", "Headset (WH-1000XM4 Hands-Free AG Audio)", "HDMI"],
+                                   default_index=0, call="Headset (WH-1000XM4 Hands-Free ")
+        self.assertEqual([m.device_info["name"] for m in group.members],
+                         ["Speakers (Realtek(R) Audio) [Loopback]",
+                          "Headset (WH-1000XM4 Hands-Free AG Audio) [Loopback]"])
+        self.assertEqual([m.audio_file_name for m in members], ["s.wav", None])
+
+    def test_one_output_when_the_call_output_is_the_default_or_unknown(self):
+        group, _ = self.make(["Speakers", "HDMI"], call="Speakers")
+        self.assertEqual(len(group.members), 1)
+        group, _ = self.make(["Speakers", "HDMI"], default_index=1, call=None)
+        self.assertEqual([m.device_info["name"] for m in group.members], ["HDMI [Loopback]"])
+
+    def test_on_off_and_start_stop_apply_to_all(self):
+        group, members = self.make(["Speakers", "Headphones"], call="Headphones")
+        group.enabled = False
+        self.assertEqual([m.enabled for m in members], [False, False])
+        stop = group.record_audio(None)
+        self.assertEqual([m.started for m in members], [1, 1])
+        stop(wait_for_stop=True)
+        for member in members:
+            member.stop_record_func.assert_called_once_with(wait_for_stop=False)
+
+    def test_a_stopped_call_output_is_dropped_but_a_stopped_default_reopens_all(self):
+        group, members = self.make(["Speakers", "Headphones"], call="Headphones")
+        members[1].alive = False
+        self.assertTrue(group.capture_alive())
+        self.assertEqual(len(group.members), 1)
+        group, members = self.make(["Speakers", "Headphones"], call="Headphones")
+        members[0].alive = False
+        self.assertFalse(group.capture_alive())         # the watcher opens everything again
+
+    def test_an_output_that_cannot_be_opened_is_skipped(self):
+        group, _ = self.make(["Speakers", "Headphones"], broken=("Speakers",), call="Headphones")
+        self.assertEqual([m.device_info["name"] for m in group.members], ["Headphones [Loopback]"])
+        with self.assertRaises(OSError):
+            self.make(["Speakers"], broken=("Speakers",))
+
+    def test_only_the_default_when_asked(self):
+        group, _ = self.make(["Speakers", "Headphones"], default_index=1, only_default=True, call="Speakers")
+        self.assertEqual([m.device_info["name"] for m in group.members], ["Headphones [Loopback]"])
+
+
+class Rec:
+    def __init__(self, name, alive=True, available=True):
+        self.name, self.alive, self.available = name, alive, available
+        self.enabled = True
+        self.stop_record_func = MagicMock()
+        self.source = SimpleNamespace(name=name)
+        self.starts = 0
+
+    def capture_alive(self):
+        return self.alive
+
+    def record_audio(self, audio_queue):
+        self.starts += 1
+        return MagicMock()
+
+    def wait_until_capturing(self, timeout):
+        return True
+
+    def get_name(self):
+        return self.name
+
+
+class TestDeviceWatcher(unittest.TestCase):
+    def make(self, signatures, mic=None, speaker=None):
+        from sdk.audio_devices import AudioDeviceWatcher
+        runtime = SimpleNamespace(user_audio_recorder=mic or Rec("old mic"),
+                                  speaker_audio_recorder=speaker or Rec("old speakers"))
+        opened, changes = [], []
+
+        def open_devices():
+            pair = (Rec(f"mic {len(opened)}"), Rec(f"speakers {len(opened)}"))
+            opened.append(pair)
+            return pair
+
+        values = iter(signatures)
+        last = [None]
+
+        def signature():
+            last[0] = next(values, last[0])
+            return last[0]
+
+        watcher = AudioDeviceWatcher(runtime, "queue", open_devices, on_change=lambda m, s: changes.append((m, s)),
+                                     signature=signature, interval=0.05, min_gap=0.2)
+        return watcher, runtime, opened, changes
+
+    def test_a_device_change_reopens_capture_once_it_has_settled(self):
+        watcher, runtime, opened, changes = self.make([(1, 1), (1, 1), (2, 1), (2, 2), (2, 2), (2, 2)])
+        old_mic, old_speaker = runtime.user_audio_recorder, runtime.speaker_audio_recorder
+        old_mic.enabled = False                               # the user had turned the microphone off
+        mic_stop, speaker_stop = old_mic.stop_record_func, old_speaker.stop_record_func
+        watcher.start()
+        self.assertTrue(wait_for(lambda: len(opened) == 1, 3))
+        time.sleep(0.4)
+        watcher.stop()
+        self.assertEqual(len(opened), 1)                      # one restart for the whole change
+        mic_stop.assert_called_once_with(wait_for_stop=True)
+        speaker_stop.assert_called_once_with(wait_for_stop=True)
+        mic, speaker = opened[0]
+        self.assertIs(runtime.user_audio_recorder, mic)
+        self.assertIs(runtime.speaker_audio_recorder, speaker)
+        self.assertFalse(mic.enabled)                         # choices kept
+        self.assertTrue(speaker.enabled)
+        self.assertEqual((mic.starts, speaker.starts), (1, 1))
+        self.assertEqual(changes, [(mic, speaker)])
+
+    def test_a_capture_that_ended_is_reopened(self):
+        watcher, runtime, opened, _ = self.make([(1, 1)], speaker=Rec("old speakers", alive=False))
+        watcher.start()
+        self.assertTrue(wait_for(lambda: len(opened) == 1, 3))
+        watcher.stop()
+
+    def test_a_device_that_keeps_failing_is_retried_less_and_less_often(self):
+        watcher, runtime, opened, _ = self.make([(1, 1)], speaker=Rec("old speakers", alive=False))
+        original = watcher.open_devices
+        watcher.open_devices = lambda: (lambda pair: (pair[0], Rec("dead", alive=False)))(original())
+        watcher.start()
+        time.sleep(1.6)
+        watcher.stop()
+        # min_gap 0.2 s doubling: about 0.2, 0.6, 1.4 s -> 3 tries, not 8
+        self.assertLessEqual(len(opened), 4)
+
+    def test_stop_waits_for_a_restart_under_way_and_nothing_opens_after(self):
+        watcher, runtime, opened, _ = self.make([(1, 1)])
+        gate = threading.Event()
+        original = watcher.open_devices
+        watcher.open_devices = lambda: (gate.wait(2), original())[1]
+        threading.Thread(target=watcher.restart, args=("test",), daemon=True).start()
+        time.sleep(0.1)
+        threading.Timer(0.3, gate.set).start()
+        watcher.stop()                                     # returns only after that restart
+        self.assertEqual(len(opened), 1)
+        watcher.restart("after stop")
+        self.assertEqual(len(opened), 1)
+
+    def test_nothing_happens_while_nothing_changes(self):
+        watcher, _, opened, _ = self.make([(1, 1)], mic=Rec("none", alive=False, available=False))
+        watcher.start()
+        time.sleep(0.4)
+        watcher.stop()
+        self.assertEqual(opened, [])
+
+    def test_signature_is_not_read_outside_windows(self):
+        from sdk.audio_devices import windows_audio_signature
+        with patch.object(sys, "platform", "linux"):
+            self.assertIsNone(windows_audio_signature())
+
+    def test_listeners_expose_their_thread(self):
+        import custom_speech_recognition as csr
+        source = csr.AudioSource.__new__(csr.AudioSource)
+        recognizer = csr.Recognizer()
+        with patch.object(csr, "AudioSource", object), \
+                patch("threading.Thread.start"):
+            stopper = recognizer.listen_in_background(source, "x", lambda *a: None)
+        self.assertTrue(hasattr(stopper, "thread"))
+
+
+class TestChosenDevices(unittest.TestCase):
+    def test_a_chosen_device_is_found_again_by_name_after_numbers_change(self):
+        from sdk import audio_recorder as ar
+        from app.transcribe.core import state
+        runtime = state.AppRuntime.__new__(state.AppRuntime)
+        runtime._chosen_devices = {}
+        recorder = MagicMock()
+        with patch.object(ar, "device_identity", return_value=("Headset Mic", 13)):
+            runtime._use_chosen_device(recorder, "mic", 3)
+        recorder.set_device.assert_called_with(index=3)
+        with patch.object(ar, "device_index_by_name", return_value=7) as lookup:
+            runtime._use_chosen_device(recorder, "mic", 3)                     # numbers moved
+        lookup.assert_called_with("Headset Mic", 13)                           # same host API
+        recorder.set_device.assert_called_with(index=7)
+        recorder.reset_mock()
+        with patch.object(ar, "device_index_by_name", return_value=None):
+            runtime._use_chosen_device(recorder, "mic", 3)                     # unplugged
+        recorder.set_device.assert_not_called()
+
+    def test_lookup_by_name_finds_loopback_and_respects_the_host_api(self):
+        from sdk import audio_recorder as ar
+        devices = [{"name": "Speakers", "hostApi": 0, "maxInputChannels": 0},
+                   {"name": "Speakers", "hostApi": 13, "maxInputChannels": 0},
+                   {"name": "Speakers [Loopback]", "hostApi": 13, "maxInputChannels": 2, "maxOutputChannels": 0}]
+
+        class PyAudio:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def get_device_count(self):
+                return len(devices)
+
+            def get_device_info_by_index(self, index):
+                return devices[index]
+
+        with patch.object(ar, "pyaudio", SimpleNamespace(PyAudio=PyAudio)):
+            self.assertEqual(ar.device_index_by_name("Speakers", 13), 1)
+            self.assertEqual(ar.device_index_by_name("Speakers [Loopback]", 13), 2)
+            self.assertIsNone(ar.device_index_by_name("Headset", 13))
+
+    def test_a_stand_in_device_counts_as_on(self):
+        from sdk import audio_recorder as ar
+        self.assertTrue(ar.UnavailableRecorder("You", "none").enabled)
