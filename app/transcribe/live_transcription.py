@@ -32,6 +32,8 @@ class _SpeakerTranscriptState:
     finalized_text: str = ""
     last_hypothesis_text: str = ""
     stability_count: int = 0
+    # Where the row's audio starts in the source's buffer timeline (None: unknown).
+    row_start_seconds: float | None = None
 
 
 class LiveTranscriptManager:
@@ -113,8 +115,26 @@ class LiveTranscriptManager:
             state.finalized_text = self._finalized_prefix(hypothesis)
             state.last_hypothesis_text = hypothesis_text
             state.stability_count = 1
+            state.row_start_seconds = hypothesis.audio_start_seconds
             return LiveTranscriptUpdate(text=state.current_text, update_previous=False, changed=True)
 
+        same_audio_start = (
+            state.row_start_seconds is not None
+            and abs(hypothesis.audio_start_seconds - state.row_start_seconds) < 0.05
+        )
+        if same_audio_start:
+            # The hypothesis is a new transcription of the whole row (its audio starts where the
+            # row starts), so it replaces the row. Merging it with the older text left words the
+            # model had since corrected in the row, next to their correction.
+            changed = hypothesis_text != state.current_text
+            state.stability_count = state.stability_count + 1 if hypothesis_text == state.last_hypothesis_text else 1
+            state.current_text = hypothesis_text
+            state.finalized_text = self._finalized_prefix(hypothesis)
+            state.last_hypothesis_text = hypothesis_text
+            return LiveTranscriptUpdate(text=state.current_text, update_previous=True, changed=changed)
+
+        # The start of the audio moved (the rolling window dropped its oldest part): join the
+        # text that is no longer covered with the new hypothesis.
         merged_text = self._merge_text(state.current_text, hypothesis_text)
         protected_text = self._protect_finalized_prefix(state.finalized_text, merged_text)
         changed = protected_text != state.current_text

@@ -29,6 +29,7 @@ class OpenAIRealtimeTranscriber(TranscriberInterface):
         config: dict,
         client_factory=OpenAIRealtimeSTTModel,
     ):
+        self.last_error = None      # why speech to text is failing right now, for the window
         self.config = config
         self.conversation = convo
         self.supports_diarization = False
@@ -113,18 +114,23 @@ class OpenAIRealtimeTranscriber(TranscriberInterface):
         """Continuously route tagged raw audio and serialize callback results."""
         self._start_enabled_clients()
         while not self._stop_event.is_set():
-            self._drain_result_queue()
             try:
-                who_spoke, data, time_spoken = audio_queue.get(timeout=0.05)
-            except queue.Empty:
-                continue
-
-            if self.transcribe and self._source_enabled.get(who_spoke, False):
+                self._drain_result_queue()
                 try:
-                    self.clients[who_spoke].append_audio(data, captured_at=time_spoken)
-                except (KeyError, TypeError, ValueError) as exception:
-                    self._queue_error(who_spoke, f"Could not process source audio: {exception}")
-            self._drain_result_queue()
+                    who_spoke, data, time_spoken = audio_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+
+                if self.transcribe and self._source_enabled.get(who_spoke, False):
+                    try:
+                        self.clients[who_spoke].append_audio(data, captured_at=time_spoken)
+                    except Exception as exception:  # pylint: disable=broad-except
+                        self._queue_error(who_spoke, f"Could not process source audio: {exception}")
+                self._drain_result_queue()
+            except Exception as exception:  # pylint: disable=broad-except
+                # This is the only thread that moves audio and results: it must not end.
+                logger.exception("OpenAI Realtime dispatch error: %s", exception)
+                self.last_error = f"Speech to text failed: {exception}"
 
         self._drain_result_queue()
 
@@ -219,6 +225,7 @@ class OpenAIRealtimeTranscriber(TranscriberInterface):
             else:
                 source_name, message = event
                 logger.error("OpenAI Realtime (%s): %s", source_name, message)
+                self.last_error = f"Speech to text ({source_name}): {message}"
         self._drain_completed_queue()
 
     def _drain_completed_queue(self):
@@ -244,6 +251,7 @@ class OpenAIRealtimeTranscriber(TranscriberInterface):
             self._partial_items[key] = event.text
 
     def _handle_completed(self, event: StreamingTranscriptEvent):
+        self.last_error = None      # text arrives again
         key = (event.source, event.item_id)
         if key in self._completed_items or not event.text.strip():
             return

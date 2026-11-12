@@ -241,17 +241,22 @@ class OpenAIRealtimeSTTModel(StreamingSTTModelInterface):
     def connected(self) -> bool:
         return self._connected_event.is_set() and not self._stop_event.is_set()
 
+    _was_connected = False
+
     def _connection_loop(self):
         url = OPENAI_REALTIME_URL
-        total_attempts = self.reconnect_attempts + 1
-        for attempt in range(total_attempts):
+        # The limit counts failures in a row: a connection that worked (the server ends long
+        # sessions, networks drop for a moment) gives the full number of attempts again.
+        attempt = 0
+        while attempt <= self.reconnect_attempts:
             if self._stop_event.is_set():
                 return
             if attempt:
                 self._emit_error(f"Realtime connection retry {attempt}/{self.reconnect_attempts}.")
-                self._sleep(self.reconnect_backoff_seconds * attempt)
+                self._sleep(min(self.reconnect_backoff_seconds * attempt, 30))
                 if self._stop_event.is_set():
                     return
+            self._was_connected = False
             try:
                 ephemeral_key = self._client_secret_factory(
                     self.api_key,
@@ -279,6 +284,7 @@ class OpenAIRealtimeSTTModel(StreamingSTTModelInterface):
                 self._websocket = None
             if self._stop_event.is_set():
                 return
+            attempt = 1 if self._was_connected else attempt + 1
         self._emit_error("Realtime connection stopped after the configured retry limit.")
         self._stop_event.set()
         self._connected_event.set()
@@ -349,6 +355,7 @@ class OpenAIRealtimeSTTModel(StreamingSTTModelInterface):
                     websocket_app.close()
                 return
             self._connected_event.set()
+            self._was_connected = True
             logger.info(
                 "OpenAI Realtime (%s): transcription session connected; "
                 "transcription model=%s",
@@ -472,7 +479,8 @@ class OpenAIRealtimeSTTModel(StreamingSTTModelInterface):
         with self._timeline_lock:
             start_ms = self._sent_audio_ms
             self._sent_audio_ms += duration_ms
-            self._audio_timeline.append((start_ms, self._sent_audio_ms, chunk_started_at))
+            if self.turn_detection == "server_vad":     # (only read, and trimmed, in that mode)
+                self._audio_timeline.append((start_ms, self._sent_audio_ms, chunk_started_at))
             if self.turn_detection != "server_vad":
                 if self._manual_buffer_started_at is None:
                     self._manual_buffer_started_at = chunk_started_at

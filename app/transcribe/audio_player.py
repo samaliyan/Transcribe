@@ -11,7 +11,7 @@ import playsound
 import gtts
 
 from .conversation import Conversation
-from . import constants
+from . import constants, prompts
 
 from tsutils import app_logging as al
 from tsutils.language import LANGUAGES_DICT
@@ -37,18 +37,25 @@ class AudioPlayer:
         For large audio text, this could take several minutes.
         """
         logger.info(f'{self.__class__.__name__} - Playing audio')  # pylint: disable=W1203
+        if not speech or not speech.strip():
+            return
+        file_name = None
         try:
             audio_obj = gtts.gTTS(speech, lang=lang)
-            temp_audio_file = tempfile.mkstemp(dir=self.temp_dir, suffix='.mp3')
-            os.close(temp_audio_file[0])
-
-            audio_obj.save(temp_audio_file[1])
-            playsound.playsound(temp_audio_file[1])
-        except playsound.PlaysoundException as play_ex:
+            handle, file_name = tempfile.mkstemp(dir=self.temp_dir, suffix='.mp3')
+            os.close(handle)
+            audio_obj.save(file_name)
+            playsound.playsound(file_name)
+        except Exception:  # pylint: disable=broad-except
+            # No internet, an unsupported language, no sound device: the reply stays on screen
+            # and this thread must go on for the next one.
             logger.error('Error when attempting to play audio.', exc_info=True)
-            logger.info(play_ex)
         finally:
-            os.remove(temp_audio_file[1])
+            if file_name is not None and os.path.exists(file_name):
+                try:
+                    os.remove(file_name)
+                except OSError:
+                    pass
 
     def play_audio_loop(self, config: dict):
         """Continuously play text as audio based on event signaling.
@@ -75,7 +82,7 @@ class AudioPlayer:
         """Get the language code from the configuration.
         """
         try:
-            return next(key for key, value in LANGUAGES_DICT.items() if value == lang)
+            return next(key for key, value in LANGUAGES_DICT.items() if value == str(lang).lower())
         except StopIteration:
             # Return dafault lang if nothing else is found
             return 'en'
@@ -90,4 +97,4 @@ class AudioPlayer:
         """
         persona_length = len(constants.PERSONA_ASSISTANT) + 2
         final_speech = speech[persona_length:].strip()
-        return final_speech[1:-1]  # Remove square brackets
+        return prompts.strip_brackets(final_speech[1:-1])  # Remove square brackets
