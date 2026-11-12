@@ -109,8 +109,8 @@ still show the window of earlier versions.
 
 Every merge into `main` that changes the program builds the Windows package, tests it on Windows (the
 window opens and closes, start-up time, a real transcription of a sample file) and publishes the next
-version by itself (1.0.2 after 1.0.1). Changes to documentation only publish nothing. For a bigger step
-(1.1.0, 2.0.0): Actions › Windows package › Run workflow, and enter the number.
+version by itself (2.0.1 after 2.0.0). Changes to documentation only publish nothing. For a bigger step
+(2.1.0, 3.0.0), write the number in `build/next-version.txt` in that merge.
 
 ## Credits and license
 
