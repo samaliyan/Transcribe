@@ -68,7 +68,37 @@ if getattr(sys, "frozen", False):
     os.chdir(os.path.dirname(sys.executable))
     connect_output()
 
-from app.transcribe.main import main  # noqa: E402  (after the folder change)
+def report_fatal_error(exception: BaseException):
+    """The program could not start or stopped with an error. Double-clicked there is no console
+    to read it from, so say it in a message box (and keep the details in the log)."""
+    import traceback  # pylint: disable=import-outside-toplevel
+    details = "".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+    try:
+        print(details, file=sys.stderr, flush=True)
+    except Exception:  # pylint: disable=broad-except
+        pass
+    if len(sys.argv) > 1:       # a command line run: the text above is enough
+        return
+    try:
+        import tkinter  # pylint: disable=import-outside-toplevel
+        from tkinter import messagebox  # pylint: disable=import-outside-toplevel
+        root = tkinter.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "Transcribe",
+            f"Transcribe stopped because of an error:\n\n{exception}\n\n"
+            "Details are in %APPDATA%\\viveku\\Transcribe\\logs\\console.txt")
+        root.destroy()
+    except Exception:  # pylint: disable=broad-except
+        pass
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        from app.transcribe.main import main  # noqa: E402  (after the folder change)
+        main()
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException as fatal:  # pylint: disable=broad-except
+        report_fatal_error(fatal)
+        sys.exit(1)

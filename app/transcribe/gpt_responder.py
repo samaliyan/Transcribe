@@ -1,14 +1,17 @@
+"""Suggested replies and summaries from an OpenAI-compatible chat API."""
 import datetime
+import threading
 import time
 from enum import Enum
-# import pprint
+
 import openai
+
 from . import constants, conversation, prompts
 from .db import AppDB as appdb
 from .db import llm_responses as llmrdb
 from .db import summaries as s
 from tsutils import app_logging as al
-from tsutils import duration, utilities
+from tsutils import duration
 
 
 logger = al.get_module_logger(al.GPT_RESPONDER_LOGGER)
@@ -23,12 +26,87 @@ SUPPORTED_REASONING_EFFORTS = {
     'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'
 }
 
+PLACEHOLDER_API_KEYS = {'', 'API_KEY', 'YOUR_API_KEY', 'sk-...'}
+
+STATUS_NO_KEY = 'no_key'        # no API key in the settings: suggestions are off
+STATUS_READY = 'ready'
+STATUS_WORKING = 'working'      # a request is running
+STATUS_ERROR = 'error'          # the last request failed; last_error says why
+
+NO_KEY_MESSAGE = 'No API key yet. Open Settings and enter the key of your AI provider.'
+NOTHING_TO_ANSWER_MESSAGE = 'Nothing has been transcribed yet.'
+
+
+class ResponderError(Exception):
+    """A request to the AI provider failed; the message can be shown to the user as it is."""
+
 
 class InferenceEnum(Enum):
     """Supported Chat Inference Providers
     """
     OPENAI = 1
     TOGETHER = 2
+
+
+def has_api_key(api_key) -> bool:
+    """True when the settings hold something that can be an API key (not the placeholder)."""
+    return str(api_key or '').strip() not in PLACEHOLDER_API_KEYS
+
+
+def describe_error(exception: Exception, model: str = '') -> str:
+    """One sentence a user can act on, for an error of the AI provider."""
+    if isinstance(exception, ResponderError):
+        return str(exception)
+    if isinstance(exception, openai.AuthenticationError):
+        return 'The AI provider rejected the API key. Check the key in Settings.'
+    if isinstance(exception, openai.PermissionDeniedError):
+        return ('The AI provider refused the request (403). The key may not have access to this model, '
+                'or the service is not available in your region: a VPN or another provider (Base URL in '
+                'Settings) can help.')
+    if isinstance(exception, openai.RateLimitError):
+        if 'quota' in str(exception).lower() or 'billing' in str(exception).lower():
+            return 'The account of this API key has no credit left. Check billing at your AI provider.'
+        return 'The AI provider is limiting requests (too many at once). It is tried again automatically.'
+    if isinstance(exception, openai.NotFoundError):
+        return f'The AI provider does not know the model "{model}". Check Model and Base URL in Settings.'
+    if isinstance(exception, openai.APITimeoutError):
+        return 'The AI provider did not answer in time. Check the internet connection (or VPN).'
+    if isinstance(exception, openai.APIConnectionError):
+        return 'The AI provider could not be reached. Check the internet connection, VPN and the Base URL in Settings.'
+    if isinstance(exception, openai.BadRequestError):
+        return f'The AI provider did not accept the request: {_short(exception)}'
+    if isinstance(exception, openai.APIStatusError):
+        return f'The AI provider reported an error ({exception.status_code}): {_short(exception)}'
+    return f'The suggestion failed: {_short(exception)}'
+
+
+def _short(exception: Exception, limit: int = 220) -> str:
+    body = getattr(exception, 'body', None)
+    text = body.get('message') if isinstance(body, dict) and body.get('message') else str(exception)
+    text = ' '.join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1] + '…'
+
+
+def test_connection(api_key: str, base_url: str, model: str, timeout: float = 20.0):
+    """Send one very small request with these settings. Returns (worked, message for the user)."""
+    if not has_api_key(api_key):
+        return False, 'Enter an API key first.'
+    if not str(model or '').strip():
+        return False, 'Enter a model name first.'
+    client = None
+    try:
+        client = openai.OpenAI(api_key=api_key.strip(), base_url=(base_url or '').strip() or None,
+                               timeout=timeout, max_retries=0)
+        client.chat.completions.create(
+            model=model.strip(),
+            messages=[{'role': 'user', 'content': 'Reply with the single word: ok'}],
+        )
+        return True, f'It works: "{model.strip()}" answered.'
+    except Exception as exception:  # pylint: disable=broad-except
+        return False, describe_error(exception, model)
+    finally:
+        if client is not None:
+            client.close()
 
 
 class GPTResponder:
@@ -38,6 +116,7 @@ class GPTResponder:
     enabled: bool = False
     model: str = None
     llm_client = None
+    settings_section: str = 'OpenAI'
 
     def __init__(self,
                  config: dict,
@@ -54,53 +133,15 @@ class GPTResponder:
         self.save_response_to_file = save_to_file
         self.response_file = file_name
         self.openai_module = openai_module
+        self.status = STATUS_READY
+        self.last_error: str | None = None
+        self._request_lock = threading.Lock()       # one reply request at a time
+        self._client_lock = threading.Lock()
+        self.configure()
 
-    def summarize(self) -> str:
-        """Ping LLM to get a summary of the conversation.
-        """
-        logger.info(GPTResponder.summarize.__name__)
-
-        chat_inference_provider = self.config['General']['chat_inference_provider']
-        if chat_inference_provider == 'openai':
-            settings_section = 'OpenAI'
-        elif chat_inference_provider == 'together':
-            settings_section = 'Together'
-
-        api_key = self.config[settings_section]['api_key']
-        base_url = self.config[settings_section]['base_url']
-        model = self.config[settings_section]['ai_model']
-
-        if not utilities.is_api_key_valid(api_key=api_key, base_url=base_url, model=model):
-            return None
-
-        with duration.Duration(name='OpenAI Summarize', screen=False):
-            timeout: int = self.config['OpenAI']['summarize_request_timeout_seconds']
-            _, temperature, reasoning_effort = self._get_openai_settings(
-                settings_section
-            )
-            prompt_content = self.conversation.get_merged_conversation_summary()
-            prompt_api_message = prompts.create_multiturn_prompt(prompt_content)
-            last_convo_id = int(prompt_content[-1][2])
-            # self._pretty_print_openai_request(prompt_api_message)
-            request = self._build_chat_completion_request(
-                prompt_api_message, timeout, temperature, reasoning_effort
-            )
-            summary_response = self.llm_client.chat.completions.create(**request)
-            collected_messages = ""
-            for chunk in summary_response:
-                chunk_message = chunk.choices[0].delta  # extract the message
-                if chunk_message.content:
-                    message_text = chunk_message.content
-                    collected_messages += message_text
-                    # print(f'{message_text}', end="")
-
-            # insert in DB
-            inv_id = appdb().get_invocation_id()
-            summary_obj = appdb().get_object(s.TABLE_NAME)
-            summary_obj.insert_summary(inv_id, last_convo_id, collected_messages)
-
-        return collected_messages
-
+    # ----------------------------------------------------------------------------------------
+    # Settings
+    # ----------------------------------------------------------------------------------------
     def _get_settings_section(self, provider: str) -> str:
         """Get the settings section based on the chat inference provider."""
         if provider == 'openai':
@@ -115,6 +156,53 @@ class GPTResponder:
         base_url = self.config[settings_section]['base_url']
         model = self.config[settings_section]['ai_model']
         return api_key, base_url, model
+
+    def configure(self):
+        """(Re)create the client from the settings as they are now.
+
+        Called at start-up and after the settings window saves, so a new key, model or
+        Base URL is used from the next request on without restarting the program.
+        """
+        api_key, base_url, model = self._get_api_settings(self.settings_section)
+        api_key = str(api_key or '').strip()
+        with self._client_lock:
+            old_client = self.llm_client
+            self.model = str(model or '').strip()
+            if has_api_key(api_key):
+                # The client's own retries are off: a retry of a live suggestion is out of date,
+                # and the next change of the transcript asks again anyway.
+                self.llm_client = self.openai_module.OpenAI(
+                    api_key=api_key, base_url=str(base_url or '').strip() or None, max_retries=0)
+                self._set_status(STATUS_READY)
+            else:
+                self.llm_client = None
+                self._set_status(STATUS_NO_KEY, NO_KEY_MESSAGE)
+        if old_client is not None:
+            try:
+                old_client.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+    def create_client(self, api_key: str, base_url: str = None):
+        """Create and initialize an OpenAI API compatible client."""
+        if not api_key:
+            raise ValueError("API key is required")
+        try:
+            if self.llm_client is not None:
+                self.llm_client.close()
+            self.llm_client = self.openai_module.OpenAI(api_key=api_key, base_url=base_url)
+        except Exception as e:
+            raise ConnectionError(f"Failed to create OpenAI client: {e}")
+
+    def _set_status(self, status: str, error: str | None = None):
+        self.status = status
+        self.last_error = error
+
+    def _client(self):
+        client = self.llm_client
+        if client is None:
+            raise ResponderError(NO_KEY_MESSAGE)
+        return client
 
     def _get_openai_settings(self, settings_section: str = 'OpenAI'):
         """Retrieve request settings without inventing unsupported parameters."""
@@ -151,6 +239,72 @@ class GPTResponder:
             request['reasoning_effort'] = reasoning_effort
         return request
 
+    # ----------------------------------------------------------------------------------------
+    # Requests
+    # ----------------------------------------------------------------------------------------
+    @staticmethod
+    def _stream_text(stream, on_text=None) -> str:
+        """Collect a streamed answer; ``on_text`` gets the text so far after each piece."""
+        collected = ''
+        for chunk in stream:
+            if not chunk.choices:           # e.g. a final usage chunk
+                continue
+            piece = chunk.choices[0].delta.content
+            if piece:
+                collected += piece
+                if on_text is not None:
+                    on_text(collected)
+        return collected
+
+    def _run(self, action):
+        """Run one request; keep the status and last error up to date. Returns None on failure."""
+        self._set_status(STATUS_WORKING)
+        try:
+            result = action()
+        except Exception as exception:  # pylint: disable=broad-except
+            message = describe_error(exception, self.model)
+            logger.error(f'LLM request failed: {exception!r}')
+            print(f'[ERROR] {message}')
+            self._set_status(STATUS_NO_KEY if self.llm_client is None else STATUS_ERROR, message)
+            return None
+        self._set_status(STATUS_READY)
+        return result
+
+    def summarize(self) -> str:
+        """Ask the LLM for a summary of the conversation. Raises ResponderError with the reason
+        when that is not possible."""
+        logger.info(GPTResponder.summarize.__name__)
+
+        def action():
+            client = self._client()
+            if not self.conversation.has_spoken_rows():
+                raise ResponderError(NOTHING_TO_ANSWER_MESSAGE)
+            with duration.Duration(name='OpenAI Summarize', screen=False):
+                timeout: int = self.config['OpenAI']['summarize_request_timeout_seconds']
+                _, temperature, reasoning_effort = self._get_openai_settings(self.settings_section)
+                prompt_content = self.conversation.get_merged_conversation_summary()
+                request = self._build_chat_completion_request(
+                    prompts.create_multiturn_prompt(prompt_content), timeout, temperature, reasoning_effort)
+                summary = self._stream_text(client.chat.completions.create(**request))
+            last_convo_id = self._last_convo_id(prompt_content)
+            if last_convo_id is not None:
+                summary_obj = appdb().get_object(s.TABLE_NAME)
+                summary_obj.insert_summary(appdb().get_invocation_id(), last_convo_id, summary)
+            return summary
+
+        summary = self._run(action)
+        if summary is None:
+            raise ResponderError(self.last_error or 'The summary could not be created.')
+        return summary
+
+    @staticmethod
+    def _last_convo_id(rows: list):
+        """Database id of the newest stored row among these conversation rows."""
+        for row in reversed(rows):
+            if row[2] is not None and int(row[2]) >= 0:
+                return int(row[2])
+        return None
+
     def _get_llm_response(self, messages, temperature, timeout,
                           reasoning_effort=None) -> str:
         """Send a request to the LLM and process the streaming response."""
@@ -158,18 +312,11 @@ class GPTResponder:
             request = self._build_chat_completion_request(
                 messages, timeout, temperature, reasoning_effort
             )
-            multi_turn_response = self.llm_client.chat.completions.create(**request)
-
-            collected_messages = ""
-            for chunk in multi_turn_response:
-                chunk_message = chunk.choices[0].delta  # extract the message
-                if chunk_message.content:
-                    message_text = chunk_message.content
-                    collected_messages += message_text
-                    self._update_conversation(persona=constants.PERSONA_ASSISTANT,
-                                              response=collected_messages,
-                                              update_previous=True)
-            return collected_messages
+            stream = self._client().chat.completions.create(**request)
+            return self._stream_text(
+                stream,
+                lambda text: self._update_conversation(persona=constants.PERSONA_ASSISTANT,
+                                                       response=text, update_previous=True))
 
     def _insert_response_in_db(self, last_convo_id: int, response: str):
         """Insert the generated response into the database."""
@@ -178,123 +325,50 @@ class GPTResponder:
         llmr_obj.insert_response(inv_id, last_convo_id, response)
 
     def generate_response_from_transcript_no_check(self) -> str:
-        """
-        Pings the LLM to get a suggested response immediately.
-
-        This method gets a response even if the continuous suggestion option is disabled.
-        It updates the conversation object with the response from the LLM.
-
-        Returns:
-            str: The generated response from the LLM.
-        """
+        """Ask the LLM for a suggested reply to the conversation now (also when automatic
+        suggestions are off). Returns the reply, or None when it failed (see ``last_error``)."""
         logger.info(GPTResponder.generate_response_from_transcript_no_check.__name__)
 
-        try:
-            chat_inference_provider = self.config['General']['chat_inference_provider']
-            settings_section = self._get_settings_section(chat_inference_provider)
-            api_key, base_url, model = self._get_api_settings(settings_section)
-
-            if not utilities.is_api_key_valid(api_key=api_key, base_url=base_url, model=model):
-                return None
-
-            timeout, temperature, reasoning_effort = self._get_openai_settings(
-                settings_section
-            )
-            multiturn_prompt_content = self.conversation.get_merged_conversation_response(
+        def action():
+            self._client()
+            if not self.conversation.has_spoken_rows():
+                raise ResponderError(NOTHING_TO_ANSWER_MESSAGE)
+            timeout, temperature, reasoning_effort = self._get_openai_settings(self.settings_section)
+            rows = self.conversation.get_merged_conversation_response(
                 length=constants.MAX_TRANSCRIPTION_PHRASES_FOR_LLM)
-            last_convo_id = int(multiturn_prompt_content[-1][2])
-            multiturn_prompt_api_message = prompts.create_multiturn_prompt(multiturn_prompt_content)
-            collected_messages = self._get_llm_response(
-                multiturn_prompt_api_message, temperature, timeout,
-                reasoning_effort
-            )
-            self._insert_response_in_db(last_convo_id, collected_messages)
+            text = self._get_llm_response(
+                prompts.create_multiturn_prompt(rows), temperature, timeout, reasoning_effort)
+            last_convo_id = self._last_convo_id(rows)
+            if text and last_convo_id is not None:
+                self._insert_response_in_db(last_convo_id, text)
+            return text
 
-        except Exception as e:
-            logger.error(f"Error in generate_response_from_transcript_no_check: {e}")
-            print(f'Error getting response from LLM: {e}')
-            return None
-
-        self._save_response_to_file(collected_messages)
-        return collected_messages
-
-    def warm_up(self):
-        """Check the API key in the background at start-up.
-
-        The first suggestion otherwise waited for an extra test request to the provider.
-        """
-        try:
-            settings_section = self._get_settings_section(self.config['General']['chat_inference_provider'])
-            api_key, base_url, model = self._get_api_settings(settings_section)
-            utilities.is_api_key_valid(api_key=api_key, base_url=base_url, model=model)
-        except Exception as exception:  # pylint: disable=broad-except
-            logger.info(f'API key check at start-up did not complete: {exception}')
-
-    def create_client(self, api_key: str, base_url: str = None):
-        """
-        Create and initialize an OpenAI API compatible client.
-
-        Args:
-            api_key (str): The API key for authentication.
-            base_url (str, optional): The base URL for the API. Defaults to None.
-
-        Returns:
-            None
-
-        Raises:
-            ValueError: If the API key is invalid.
-            ConnectionError: If the client fails to connect.
-        """
-        if not api_key:
-            raise ValueError("API key is required")
-
-        try:
-            if self.llm_client is not None:
-                self.llm_client.close()
-            self.llm_client = self.openai_module.OpenAI(api_key=api_key, base_url=base_url)
-        except Exception as e:
-            raise ConnectionError(f"Failed to create OpenAI client: {e}")
-
-    def process_response(self, input_str: str) -> str:
-        """
-        Processes a given input string by extracting relevant data from LLM response.
-
-        Args:
-            input_str (str): The input string containing LLM response data.
-
-        Returns:
-            str: A processed string with irrelevant content removed.
-        """
-        if input_str is None:
-            raise ValueError("input_str cannot be None")
-
-        lines = input_str.split(sep='\n')
-        response_lines = []
-
-        for line in lines:
-            # Skip any responses that contain content like
-            # Speaker 1: <Some statement>
-            # This is generated content added by OpenAI that can be skipped
-            if 'Speaker' in line and ':' in line:
-                continue
-            response_lines.append(line.strip().strip('[').strip(']'))
-
-        # Create a list and then use that to create a string for
-        # performance reasons, since strings are immutable in python
-        response = ''.join(response_lines)
+        with self._request_lock:
+            response = self._run(action)
+        if response:
+            self._save_response_to_file(response)
         return response
 
+    def warm_up(self):
+        """Open the connection to the provider in the background at start-up, so the first
+        suggestion does not also wait for DNS and the TLS handshake. Costs nothing."""
+        client = self.llm_client
+        if client is None:
+            return
+        try:
+            client.models.list(timeout=10)
+        except Exception as exception:  # pylint: disable=broad-except
+            # Not every compatible provider lists models; a real problem shows at the first request.
+            logger.info(f'Warm-up request did not complete: {exception!r}')
+
+    def process_response(self, input_str: str) -> str:
+        """Remove the parts of an LLM answer that are not the reply itself."""
+        if input_str is None:
+            raise ValueError("input_str cannot be None")
+        return prompts.strip_brackets(input_str)
+
     def generate_response_from_transcript(self) -> str:
-        """
-        Pings the OpenAI LLM model to get a response from the Assistant.
-
-        Logs the method call and checks if the feature is enabled before
-        proceeding with response generation.
-
-        Returns:
-            str: The response from the OpenAI LLM model.
-            Returns an empty string if the feature is disabled.
-        """
+        """Ask for a suggestion if automatic suggestions are on."""
         logger.info("generate_response_from_transcript called")
 
         if not self.enabled:
@@ -303,69 +377,39 @@ class GPTResponder:
         return self.generate_response_from_transcript_no_check()
 
     def generate_response_for_selected_text(self, text: str):
-        """Ping LLM to get a suggested response right away.
-            Gets a response even if the continuous suggestion option is disabled.
-            Updates the conversation object with the response from LLM.
-        """
-        try:
-            logger.info(GPTResponder.generate_response_for_selected_text.__name__)
-            chat_inference_provider = self.config['General']['chat_inference_provider']
+        """Ask the LLM for a reply to the text the user selected in the transcript."""
+        logger.info(GPTResponder.generate_response_for_selected_text.__name__)
 
-            chat_inference_provider = self.config['General']['chat_inference_provider']
-            settings_section = self._get_settings_section(chat_inference_provider)
-            api_key, base_url, model = self._get_api_settings(settings_section)
-
-            timeout, temperature, reasoning_effort = self._get_openai_settings(
-                settings_section
-            )
-
-            if not utilities.is_api_key_valid(api_key=api_key, base_url=base_url, model=model):
-                return None
-
+        def action():
+            client = self._client()
+            messages = prompts.create_prompt_for_text(text=text, config=self.config)
+            if messages is None:
+                raise ResponderError('Select some text in the transcript first.')
+            timeout, temperature, reasoning_effort = self._get_openai_settings(self.settings_section)
             with duration.Duration(name='OpenAI Chat Completion Selected', screen=False):
-                prompt = prompts.create_prompt_for_text(text=text, config=self.config)
-                request = self._build_chat_completion_request(
-                    prompt, timeout, temperature, reasoning_effort
-                )
-                llm_response = self.llm_client.chat.completions.create(**request)
+                request = self._build_chat_completion_request(messages, timeout, temperature, reasoning_effort)
+                stream = client.chat.completions.create(**request)
+                return self._stream_text(
+                    stream,
+                    lambda so_far: self._update_conversation(persona=constants.PERSONA_ASSISTANT,
+                                                             response=so_far, update_previous=True))
 
-                # Update conversation with an empty response. This response will be updated
-                # by subsequent updates from the streaming response
-                self._update_conversation(persona=constants.PERSONA_ASSISTANT,
-                                          response="  ",
-                                          update_previous=False)
-                collected_messages = ""
-                for chunk in llm_response:
-                    chunk_message = chunk.choices[0].delta  # extract the message
-                    if chunk_message.content:
-                        message_text = chunk_message.content
-                        collected_messages += message_text
-                        # print(f"{message_text}", end="")
-                        self._update_conversation(persona=constants.PERSONA_ASSISTANT,
-                                                  response=collected_messages,
-                                                  update_previous=True)
-
-        except Exception as exception:
-            print('Error when attempting to get a response from LLM.')
-            print(exception)
-            logger.error('Error when attempting to get a response from LLM.')
-            logger.exception(exception)
-            return prompts.INITIAL_RESPONSE
-
-        processed_response = collected_messages
-
-        self._save_response_to_file(processed_response)
-
-        return processed_response
+        with self._request_lock:
+            response = self._run(action)
+        if response:
+            self._save_response_to_file(response)
+        return response
 
     def _save_response_to_file(self, text: str):
         if self.save_response_to_file:
-            with open(file=self.response_file, mode="a", encoding='utf-8') as f:
-                f.write(f'{datetime.datetime.now()} - {text}\n')
+            try:
+                with open(file=self.response_file, mode="a", encoding='utf-8') as f:
+                    f.write(f'{datetime.datetime.now()} - {text}\n')
+            except OSError as exception:
+                logger.error(f'Could not write {self.response_file}: {exception}')
 
     def _update_conversation(self, response, persona, update_previous=False):
         """Update the internaal conversation state"""
-        logger.info(GPTResponder._update_conversation.__name__)
         if response != '':
             self.response = response
             self.conversation.update_conversation(persona=persona,
@@ -391,7 +435,7 @@ class GPTResponder:
                 remaining = settle_until - time.monotonic()
                 if remaining <= 0 or not changed.wait(min(RESPONSE_SETTLE_SECONDS, remaining)):
                     break
-            if not self.enabled:
+            if not self.enabled or self.llm_client is None:
                 continue
             if last_request is not None:
                 wait = self.llm_response_interval - (time.monotonic() - last_request)
@@ -407,24 +451,12 @@ class GPTResponder:
     def update_response_interval(self, interval):
         """Change the interval for pinging LLM
         """
-        # Very chatty log statement
-        # logger.info(GPTResponder.update_response_interval.__name__)
         self.llm_response_interval = interval
-
-    def _pretty_print_openai_request(self, message: str):
-        """Format the openAI request in a nice print format"""
-        print('[')
-        for item in message:
-            print('  {')
-            print(f'    \'role\': \'{item["role"]}\'')
-            print(f'    \'content\': \'{item["content"]}\'')
-            print('  }')
-
-        print(']')
 
 
 class OpenAIResponder(GPTResponder):
-    """Uses OpenAI for Chat Inference"""
+    """Uses OpenAI (or any OpenAI-compatible provider set as Base URL) for Chat Inference"""
+    settings_section = 'OpenAI'
 
     def __init__(self,
                  config: dict,
@@ -432,39 +464,28 @@ class OpenAIResponder(GPTResponder):
                  response_file_name: str,
                  save_to_file: bool = False,
                  base_url: str = None):
-        logger.info(OpenAIResponder.__name__)
-        self.config = config
-        api_key = self.config['OpenAI']['api_key']
-        base_url = self.config['OpenAI']['base_url']
-        self.llm_client = openai.OpenAI(api_key=api_key, base_url=base_url)
-        self.model = self.config['OpenAI']['ai_model']
-        logger.info(f'Configured OpenAI response generation. Model: {self.model}')
-        super().__init__(config=self.config,
+        del base_url
+        super().__init__(config=config,
                          convo=convo,
                          save_to_file=save_to_file,
                          file_name=response_file_name)
+        logger.info(f'Configured OpenAI response generation. Model: {self.model}')
 
 
 class TogetherAIResponder(GPTResponder):
     """Uses TogetherAI for Chat Inference"""
+    settings_section = 'Together'
 
     def __init__(self,
                  config: dict,
                  convo: conversation.Conversation,
                  response_file_name: str,
                  save_to_file: bool = False):
-        logger.info(TogetherAIResponder.__name__)
-        self.config = config
-        api_key = self.config['Together']['api_key']
-        base_url = self.config['Together']['base_url']
-        self.llm_client = openai.OpenAI(api_key=api_key,
-                                        base_url=base_url)
-        self.model = self.config['Together']['ai_model']
-        logger.info(f'Configured Together AI response generation. Model: {self.model}')
-        super().__init__(config=self.config,
+        super().__init__(config=config,
                          convo=convo,
                          save_to_file=save_to_file,
                          file_name=response_file_name)
+        logger.info(f'Configured Together AI response generation. Model: {self.model}')
 
 
 class InferenceResponderFactory:
@@ -477,14 +498,7 @@ class InferenceResponderFactory:
                                response_file_name: str,
                                save_to_file: bool = False,
                                ) -> GPTResponder:
-        """Get the appropriate Inference Provider class instance
-        Args:
-          provider: InferenceEnum: The Inference provider enum
-          config: dict: Used to pass all configuration parameters
-          convo: Conversation: Conversation object for storing all conversation text
-          save_to_file: bool: Save LLM responses to file or not
-          response_file_name: str: Filename for saving LLM responses
-        """
+        """Get the appropriate Inference Provider class instance"""
         if not isinstance(provider, InferenceEnum):
             raise TypeError('InferenceResponderFactory: provider should be an instance of InferenceEnum')
 
@@ -500,7 +514,3 @@ class InferenceResponderFactory:
                                        response_file_name=response_file_name)
 
         raise ValueError("Unknown Inference Provider type")
-
-
-if __name__ == "__main__":
-    print('GPTResponder')

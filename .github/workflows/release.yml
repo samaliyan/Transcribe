@@ -73,7 +73,8 @@ jobs:
       - name: Check the package contents
         shell: bash
         run: |
-          for f in Transcribe.exe parameters.yaml override.yaml version.txt bin/README.md; do
+          for f in Transcribe.exe parameters.yaml override.yaml version.txt bin/README.md README.txt \
+                   models/faster-whisper-base/model.bin models/faster-whisper-base/tokenizer.json; do
             test -f "dist/Transcribe/$f" || { echo "::error::Missing in package: $f"; exit 1; }
           done
           ls dist/Transcribe/_internal/customtkinter/assets/themes/blue.json >/dev/null \
@@ -97,6 +98,9 @@ jobs:
           timeout 240 ./Transcribe.exe -t "$GITHUB_WORKSPACE/tests/english.wav" -m tiny -o sample.txt > run.txt 2>&1 || true
           cat run.txt
           test -s sample.txt || { echo "::error::The exe did not transcribe the sample file"; exit 1; }
+          if grep -q "Voice activity filter is off" run.txt; then
+            echo "::error::The voice activity filter does not work in the package"; exit 1
+          fi
           cat sample.txt
           tr -d '[:punct:]' < sample.txt | tr 'A-Z' 'a-z' | grep -Eq "(1|one).*(2|two).*(3|three)" \
             || { echo "::error::Unexpected transcription"; exit 1; }

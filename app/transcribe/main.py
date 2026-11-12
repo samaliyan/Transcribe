@@ -23,6 +23,7 @@ from tsutils import configuration
 from .appui import AppUI
 from .cli.arguments import create_args, update_args_config
 from .cli.batch import handle_batch_tasks
+from .core.conversation import APP_DIR
 from .core.state import create_app_runtime
 from .desktop import DesktopController
 from .desktop.runtime import (
@@ -33,13 +34,36 @@ from .desktop.runtime import (
 )
 
 
+def read_version() -> str:
+    """'1.2.0' for a released package, 'dev' when run from the source code."""
+    try:
+        text = (APP_DIR / "version.txt").read_text(encoding="utf-8").strip()
+    except OSError:
+        return "dev"
+    first = text.split()[0] if text else ""
+    return f"v{first}" if first[:1].isdigit() and "." in first else "dev"
+
+
+def apply_proxy(config: dict):
+    """A proxy from the settings is used for every connection the program makes."""
+    proxy = str(config["General"].get("proxy") or "").strip()
+    if proxy:
+        for name in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
+            os.environ[name] = proxy
+
+
 def main():
     """Primary method to run transcribe
     """
     _mark("program code loaded")
     args = create_args()
 
-    config = configuration.Config().data
+    # The settings files are next to the program, wherever it is started from.
+    config = configuration.Config(
+        default_config_filename=str(APP_DIR / "parameters.yaml"),
+        override_config_filename=str(APP_DIR / "override.yaml"),
+    ).data
+    apply_proxy(config)
     runtime = create_app_runtime()
 
     update_args_config(args, config)
@@ -49,7 +73,7 @@ def main():
     initialize_desktop_runtime(runtime, config)
     _mark("audio devices and speech to text ready to start")
 
-    # Convert raw audio files to real wav file format when program exits
+    # Save the transcript and close devices when the program exits
     atexit.register(shutdown, runtime)
 
     start_audio_capture(runtime, config)
@@ -61,6 +85,7 @@ def main():
     controller = DesktopController(config=config, runtime=runtime)
     aui = AppUI(config=config, runtime=runtime, controller=controller)
     initiate_app_threads(runtime=runtime, config=config)
+    aui.set_version(read_version())
     _mark("window built")
 
     print("READY")

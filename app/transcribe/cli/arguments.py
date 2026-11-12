@@ -77,8 +77,9 @@ def create_args() -> argparse.Namespace:
         "-m",
         "--model",
         action="store",
-        choices=["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large", "turbo"],
-        default="base",
+        choices=["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large",
+                 "large-v3-turbo", "turbo"],
+        default=None,
         help="Specify the OpenAI Local Transcription model file to use.\nThe necessary model files will be downloaded once at run time.",
     )
     cmd_args.add_argument(
@@ -116,9 +117,7 @@ def update_args_config(args: argparse.Namespace, config: dict):
     if args.model is not None:
         config["OpenAI"]["local_transcripton_model_file"] = args.model
         config["WhisperCpp"]["local_transcripton_model_file"] = args.model
-    else:
-        config["OpenAI"]["local_transcripton_model_file"] = "base"
-        config["WhisperCpp"]["local_transcripton_model_file"] = "base"
+    # (without -m the model chosen in the settings is used)
 
     if args.api:
         config["General"]["use_api"] = args.api

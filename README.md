@@ -1,303 +1,119 @@
-<img src="assets/Transcribe-2.png" width="100">
+# Transcribe
 
-## Save on your Google Workspace subscriptions
-Create your Google Workspace subscription using this [link](https://referworkspace.app.goo.gl/kAZz) to save 10%. 
+A Windows program that writes down a live conversation as it happens, and suggests what to say next.
 
+- **Transcript**: what you say (microphone) and what the others say (the sound of your computer: a
+  meeting, a call, a video) appear as text within seconds, in two colours.
+- **Suggested reply**: an AI model reads the conversation and proposes your next answer, automatically
+  or when you press **F2**.
+- **Summary** of the conversation at any moment.
 
-## Source Code Install Video
+![The Transcribe window](assets/Screenshot-3.png)
 
-Thanks to [Fahd Mirza](https://www.fahdmirza.com/) for the [installation video](https://www.youtube.com/watch?v=RX86zKdCpMc) for Transcribe.
+## Download and start
 
+1. Open [Releases](https://github.com/samaliyan/transcribe/releases) and download
+   `Transcribe-<version>-windows.zip` (Windows 10/11, 64-bit).
+2. Unzip it anywhere and double-click `Transcribe.exe`. Nothing else has to be installed.
+3. Transcription starts at once and needs no internet: the speech to text model is inside the package.
+4. For suggested replies: **Settings › AI replies**, enter the API key of your AI provider, press
+   **Test the connection**, then **Save**.
 
-<a href="https://www.youtube.com/watch?feature=player_embedded&v=RX86zKdCpMc" target="_blank">
- <img src="https://img.youtube.com/vi/RX86zKdCpMc/0.jpg" alt="Watch the video" width="240" height="180"/>
-</a>
+To update, unzip the new version and copy your `override.yaml` (your settings) into the new folder.
 
-Thanks to [Lappu AI](https://www.lappuai.com/) for their support and multitude of pro bono contributions to this project.
+## Using it
 
-# 👂🏻️ Transcribe ✍🏼️
+| | |
+|---|---|
+| **F2** or **Ctrl+Enter** | Suggest a reply now |
+| **F3** | Automatic suggestions on / off |
+| **F4** | Pause / resume transcription |
+| **Ctrl+S** | Save the transcript |
+| **Ctrl+,** | Settings |
+| **Ctrl + / Ctrl −** | Larger / smaller text |
 
-## ⬇️ Download (Windows)
+- **Microphone / Speaker** (top left) switch each source on and off. They also show when no device was found.
+- **Spoken language** is the language people speak; **Reply in** is the language of the suggestions.
+- Click a line of the transcript to see the reply that was suggested at that point; right-click for
+  *Reply to the selected text* and *Edit this line*.
+- **More › Keep the window on top** keeps the window visible next to a meeting.
+- The transcript of every session is saved when the program closes
+  (**More › Open the folder with transcripts and logs**).
+- If something cannot work (no internet, a rejected key, a missing device), the window says what and why.
 
-Open [Releases](https://github.com/samaliyan/transcribe/releases), download `Transcribe-<version>-windows.zip`,
-unzip it and double-click `Transcribe.exe` (Windows 10/11, 64-bit). Nothing else needs to be installed.
-The first start downloads the speech to text model once. To use an OpenAI API key, put it in `override.yaml`
-next to `Transcribe.exe`. A computer without a microphone or speaker device still starts; it uses the other source.
+## Settings
 
-New versions (maintainers): every merge into main that changes the program publishes the next version by itself
-(1.0.2 after 1.0.1), after the package is built and tested on Windows (window start, start-up time, a real
-transcription of a sample file). Changes to documentation only publish nothing. For a bigger step (1.1.0, 2.0.0):
-Actions › Windows package › Run workflow, and enter the number. Every push to another branch builds and tests the
-package without publishing it.
+**AI replies.** Any OpenAI-compatible provider works: enter its key, its address (*Base URL*) and the model
+name exactly as the provider writes it. If the provider is not reachable from your network, a VPN or a
+proxy (**Settings › General**) is needed; transcription on this computer keeps working without either.
 
-## ⚡ Faster live pipeline (this fork)
+**Speech to text.**
 
-This fork rebuilds the live audio path so transcripts and suggestions keep up with the conversation:
+| Engine | Cost | Notes |
+|---|---|---|
+| On this computer (default) | free | Private and offline. Model `base` comes with the program; `small` is more accurate and needs a good CPU; larger ones need a GPU. Other models are downloaded once. |
+| OpenAI API | paid | Much more accurate, above all for languages other than English. Uses the same key and Base URL as the replies. |
+| OpenAI Realtime | paid | Streaming; see [docs/OpenAIRealtime.md](docs/OpenAIRealtime.md). |
+| Deepgram | paid | Needs a Deepgram key. |
 
-- **Audio is converted once, in memory.** Each captured phrase becomes 16 kHz mono when it is recorded
-  (about 6 times less data than 48 kHz stereo). No temporary WAV file and no ffmpeg run per phrase;
-  ffmpeg is now only needed to transcribe files from the command line with openai-whisper or whisper.cpp.
-- **Microphone and speaker are transcribed in parallel**, each on its own worker, so one slow request
-  never holds back the other side.
-- **No growing backlog.** When transcription is slower than speech, the audio that is waiting is merged
-  into one request instead of one request per phrase.
-- **Short requests during long speech.** Text the model has finished with is committed and its audio leaves
-  the buffer (`live_transcription_commit_seconds`, default 10). Requests stay around 10–15 s of audio
-  instead of growing to the 30 s window, and the OpenAI API path now asks for segment timestamps
-  (`verbose_json`) so this also works there.
-- **Faster local speech to text, much smaller install.** `faster-whisper` (CTranslate2, int8 on CPU) is the
-  local engine: the same Whisper models, about 4 times faster on a CPU, and no PyTorch. `setup.bat` no longer
-  downloads PyTorch with CUDA (about 2.5 GB); the install is now a few hundred MB. An NVIDIA GPU is optional
-  (`app\transcribe\setup-gpu.bat`); without its libraries the CPU is used. The original `openai-whisper`
-  engine is optional too (`app\transcribe\setup-openai-whisper.bat`, then `local_engine: openai-whisper`).
-  The 2023 whisper.cpp files were removed from `bin`; see `bin\README.md` for the current build.
-- **Suggestions start when the transcript changes**, instead of on a fixed timer. `llm_response_interval`
-  (default now 5 s) is the minimum gap between two automatic requests; a very low value means more requests
-  (and cost) while someone talks. The API key is checked in the background at start-up instead of before the
-  first answer.
-- **Lighter UI and database work.** A speaker's newest row is updated in place (no search and reflow of the
-  whole transcript per update), the answer box is redrawn only when its text changes, and streamed answer
-  tokens no longer cause a database query, update and commit each.
+For Persian and other non-English conversations the small local models make many mistakes: use an online
+engine (or a GPU with a large model) when the result matters.
 
-In a simulation (`tools/latency_simulation.py`) with 90 s of non-stop speech and the same speech to text cost for both versions
-(0.4 s + 0.05 s per second of audio, typical of a cloud API) the average delay before words appear went from
-1.7 s to 0.9 s and the audio sent went from 765 s to 309 s. With a slow local engine (0.5 s + 0.35 s per second
-of audio) the old pipeline fell behind and still had half of the words missing 40 s after the speaker
-stopped; the new one kept a delay of about 6 s with no words missing.
+**Assistant.** Choose a role (meeting assistant, job interview, explaining, casual) and add facts about
+yourself and the meeting to the instructions: the replies get much better with that context.
 
+All settings are stored in `override.yaml` next to the program (the API key too, as plain text: do not
+share that file). `parameters.yaml` lists every option with its default.
 
-[Join the community](https://transcribe-workspace.slack.com/channels/general)
+## فارسی (راهنمای کوتاه)
 
-Write an [email](waveblueseawave@gmail.com) to receive invite to the community channel or share your email in an issue.
+۱. از بخش [Releases](https://github.com/samaliyan/transcribe/releases) فایل `Transcribe-<version>-windows.zip`
+را بگیرید، از حالت فشرده خارج کنید و `Transcribe.exe` را اجرا کنید.
 
-Transcribe provides real time transcription for microphone and speaker output. It generates a suggested conversation response using OpenAI's chatGPT (or OpenAI API compatible provider)  relevant to the current conversation.
+۲. رونویسی بلافاصله و بدون اینترنت شروع می‌شود (صدای میکروفون = You، صدای خروجی کامپیوتر = Speaker).
 
-## Why Transcribe over other Speech to Text apps ##
-- Use Most of the functionality for **FREE**
-- Multi Lingual support
-- Use current OpenAI models, including GPT-5.6 Luna, or other inference models from OpenAI-compatible providers such as [Together](https://docs.together.ai/docs/inference-models)
-- Streaming LLM responses instead of waiting for a complete response
-- Upto date with the latest OpenAI libraries
-- Get LLM responses for selected text
-- Install and use without python or other dependencies
-- Security Features
-- Choose Audio Inputs (Speaker or Mic or Both)
-- Speech to Text
-    - Offline - FREE (faster-whisper; optional: openai-whisper, whisper.cpp, SenseVoice)
-    - Online - paid
-      - OpenAI Whisper - **(Encouraged)**
-      - OpenAI Realtime (`gpt-live-transcribe`)
-      - Deepgram
-- Chat Inference Engines
-    - OpenAI
-    - Together
-    - Perplexity
-    - Azure hosted OpenAI - Some users have reported requiring code changes to make Azure work. Feedback appreciated.
-- Conversation Summary
-- Prompt customization
-- Save chat history
-- Response Audio
+۳. برای پیشنهاد پاسخ: **Settings › AI replies**، کلید API، آدرس سرویس (Base URL) و نام مدل را وارد کنید،
+**Test the connection** را بزنید و بعد **Save**.
 
-## Response Generation ##
-Response generation requires a paid account with an API Key for an OpenAI API compatible provider like 
-OpenAI (**Encouraged**)
-or Deepgram ($200 free credits)
-or Together ($25 free Credits)
-or Azure
+۴. برای گفت‌وگوی فارسی: «Spoken language» را روی Persian بگذارید. مدل‌های کوچکِ داخل برنامه برای فارسی
+خطای زیادی دارند؛ برای کار مهم در **Settings › Speech to text** موتور «OpenAI API» را انتخاب کنید.
 
-Transcribe defaults to OpenAI `gpt-5.6-luna` for cost-efficient response generation. The model can be changed in `parameters.yaml` or `override.yaml`; use `gpt-5.6-terra` for a balance of intelligence and cost, or `gpt-5.6` for flagship capability.
-Together provides a large selection of [Inference models](https://docs.together.ai/docs/inference-models). Any of these can be used by making changes to `override.yaml` file.
+۵. **F2** هر لحظه پاسخ پیشنهادی می‌گیرد، **F4** رونویسی را متوقف/ادامه می‌دهد، و متن هر جلسه هنگام بستن
+برنامه خودکار ذخیره می‌شود.
 
-When using OpenAI, without the OpenAI key, using continuous response or any action that requires interaction with the online LLM gives an error similar to below
+## Running from the source code
 
-```
-Error when attempting to get a response from LLM.
-Error code: 401 - {'error': {'message': 'Incorrect API key provided: API_KEY. You can find your API key at https://platform.openai.com/account/api-keys.', 'type': 'invalid_request_error', 'param': None, 'code': 'invalid_api_key'}}
+```bash
+git clone https://github.com/samaliyan/transcribe
 ```
 
-With a valid OpenAI key and no available credits, using continuous response gives an error similar to below
-```
-Error when attempting to get a response from LLM. Error code: 429 - {'error': {'message': 'You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://platform.openai.com/docs/guides/error-codes/api-errors.', 'type': 'insufficient_quota', 'param': None, 'code': 'insufficient_quota'}} 
-```
+Then, on Windows with Python 3.11 or 3.12, run `setup.bat` once and start the program with:
 
-
-## ![Alt text](assets/on-demand-service-48.png) On Demand Features ![Alt text](assets/on-demand-service-48.png) ##
-We develop mutually beneficial features on demand.
-
-Create an issue in the repo to request mutually beneficial on demand features.
-
-Connect on LinkedIn to discuss further.
-
-
-## Features ##
-- [Multilingual support](./docs/Multilingual.md)
-- [Response Customization](./docs/ResponseCustomization.md)
-- [Audio Customization](./docs/AudioCustomization.md)
-- [Response for selected text](./docs/SelectedResponse.md)
-- [Speech Mode](./docs/SpeechMode.md)
-- [Save Content](./docs/SaveContent.md)
-- [Model Selection](./docs/ModelSelection.md)
-- [Experimental SenseVoiceSmall backend](./docs/SenseVoice.md)
-- [OpenAI Realtime transcription](./docs/OpenAIRealtime.md)
-- [Batch Operations](./docs/BatchOperations.md)
-- [Application Configuration](./docs/AppConfig.md)
-- [OpenAI API Compatible Provider Support](./docs/Providers.md)
-
-
-## Security ##
-- <b>Secret scanning</b>: Continuous Integration with [GitGuardian](https://www.gitguardian.com/)
-- <b>Static Code Analysis</b>: Regular static code scan scan with [Bandit](https://bandit.readthedocs.io/en/latest/)
-- <b>Static Code Analysis</b>: Incorporate Snyk for static analysis of code on every check in
-- <b>Secure Transmission</b>: All secure communications for any network communications
-- <b>Dependency Security</b>: All strictest security features enabled in the Github repo
-
-
-## Developer Guide ##
-[Developer Guide](./docs/DeveloperGuide.md)
-
-
-## Software Installation
-
-Note that installation files are generated every few weeks. Generated binaries will almost always trail the latest codebase available in the repo.
-
-Latest Binary
-- Generated: 2024-06-02
-- Git version: 3b3502d
-
-1. Install ffmpeg
-
-First, install Chocolatey, a package manager for Windows.
-
-Open PowerShell as Administrator and run the following command:
-```
-Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-```
-Once Chocolatey is installed, install FFmpeg by running the following command in PowerShell:
-```
-choco install ffmpeg
-```
-Run these commands in a PowerShell window with administrator privileges. For any issues during the installation, visit the official [Chocolatey](https://chocolatey.org/) and [FFmpeg](https://ffmpeg.org/) websites for troubleshooting.
-
-2. Download the zip file from
-```
-https://drive.google.com/file/d/1kcgGbTKxZqgbJOShL0bc3Do34lLouYxF/view?usp=drive_link
-
-
-Using GPU provides 2-3 times faster reseponse time depending on processing power of GPU.
-```
-3. Unzip the files in a folder.
-
-4. (Optional) Add Open API key in `override.yaml` file in the transcribe directory:
-
-   Create an [OpenAI account](https://openai.com/) or account from another provider
-
-   Add OpenAI API key in `override.yaml` file manually. Open in a text editor and add these lines:
-
-```
-OpenAI:
-   api_key: 'API_KEY'
+```bash
+cd app\transcribe
 ```
 
-   Replace "API_KEY" with the actual OpenAI API key. Save the file.
-
-5. Execute the file `transcribe\transcribe.exe\transcribe.exe`
-
-
-
-## 🆕 Best Performance with GPU 🥇
-Local speech to text runs well on a CPU. With an NVIDIA GPU it is faster still: after `setup.bat`, run
-
-```
-app\transcribe\setup-gpu.bat
-```
-
-It installs the CUDA 12 libraries the engine needs into the virtual environment (no separate CUDA
-installation). The GPU is then detected and used by itself; without it the CPU is used.
-
-## 🆕 Getting Started 🥇
-
-Follow below steps to run transcribe on your local machine.
-
-### 📋 Prerequisites
-
-- Python >=3.11.0
-- (Optional) An OpenAI API key (set up a paid [OpenAI account](https://platform.openai.com/))
-- Windows OS (Not tested on others)
-- (Optional) FFmpeg — only for transcribing files from the command line with openai-whisper or whisper.cpp.
-  Live transcription and the standard local engine do not need it.
-
-Steps to install FFmpeg on your system, if you need it.
-
-First, install Chocolatey, a package manager for Windows.
-
-Open PowerShell as Administrator and run the following command:
-```
-Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-```
-Once Chocolatey is installed, install FFmpeg by running the following command in PowerShell:
-```
-choco install ffmpeg
-```
-Run these commands in a PowerShell window with administrator privileges. For any issues during the installation, visit the official [Chocolatey](https://chocolatey.org/) and [FFmpeg](https://ffmpeg.org/) websites for troubleshooting.
-
-### 🔧 Code Installation
-
-1. Clone transcribe repository:
-
-   ```
-   git clone https://github.com/vivekuppal/transcribe
-   ```
-
-2. Run setup file
-
-   ```
-   setup.bat
-   ```
-
-3. (Optional) Provide OpenAI API key in `override.yaml` file in the transcribe directory:
-
-   Create the following section in `override.yaml` file
-   ```yaml
-   OpenAI:
-     api_key: 'API_KEY'
-   ```
-   Alter the line:
-   
-      ```
-        api_key: 'API_KEY'
-      ```
-      Replace "API_KEY" with the actual OpenAI API key. Save the file.
-
-
-### 🎬 Running Transcribe
-
-Run the main script from `app\transcribe\` folder:
-
-```
+```bash
 python main.py
 ```
 
-To use native low-latency OpenAI streaming transcription instead of the default local Whisper backend:
+`python main.py --help` lists the command line options (transcribing an audio file with `-t`, choosing
+devices, and so on). The unit tests run with `python -m pytest tests -q` in `app\transcribe`.
 
-```powershell
-python main.py -stt openai-realtime
-```
+More detail on single subjects is in [docs](docs): [providers](docs/Providers.md),
+[audio devices](docs/AudioCustomization.md), [batch use](docs/BatchOperations.md),
+[configuration files](docs/AppConfig.md), [developer guide](docs/DeveloperGuide.md). Some of those pages
+still show the window of earlier versions.
 
-This mode requires an OpenAI API key and API billing, which is separate from a ChatGPT subscription. Microphone and Windows speaker loopback audio use independent sessions and remain labeled `You` and `Speaker`. See [OpenAI Realtime transcription](./docs/OpenAIRealtime.md) for configuration, costs, privacy, consent, and limitations.
+## New versions (maintainers)
 
-Upon initiation, Transcribe will begin transcribing microphone input and speaker output in real-time, optionally generating a suggested response based on the conversation. It is suggested to use continuous response feature after 1-2 minutes, once there is enough content in transcription window to provide enough context to the LLM.
+Every merge into `main` that changes the program builds the Windows package, tests it on Windows (the
+window opens and closes, start-up time, a real transcription of a sample file) and publishes the next
+version by itself (1.0.2 after 1.0.1). Changes to documentation only publish nothing. For a bigger step
+(1.1.0, 2.0.0): Actions › Windows package › Run workflow, and enter the number.
 
+## Credits and license
 
-## 👤 License 📖
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🤝 Contributions 🤝
-
-Contributions are welcome! Open issues or submit pull requests to improve Transcribe.
-
-## Videos
-- [Install Video](https://www.youtube.com/watch?v=RX86zKdCpMc) Thanks to Fahd Mirza.
-- [Fireside chat](https://www.youtube.com/watch?v=vUm-elVkxOI) for Transcribe.
-
-## Acknowledgements
-This project started out as a fork of [ecoute](https://github.com/SevaSk/ecoute/). It has diverged significantly from the original implementation so we decided to remove the link to ecoute.
+This is a fork of [vivekuppal/transcribe](https://github.com/vivekuppal/transcribe) (itself based on
+[ecoute](https://github.com/SevaSk/ecoute)), with a rebuilt live audio pipeline and a new window.
+MIT license, see [LICENSE](LICENSE).

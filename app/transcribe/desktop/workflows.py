@@ -11,7 +11,7 @@ from .services import ConversationInsightsService
 
 logger = al.get_module_logger(al.UI_LOGGER)
 
-SUMMARY_FAILURE_MESSAGE = "Failed to get summary. Please check you have a valid API key."
+SUMMARY_FAILURE_MESSAGE = "The summary could not be created. Check the API key and the internet connection."
 
 
 class DesktopWorkflowService:
@@ -47,7 +47,9 @@ class DesktopWorkflowService:
             self.global_vars.update_response_now = True
             response_string = response_generator()
             if self.global_vars.read_response and self.global_vars.audio_player_var is not None:
-                self.global_vars.audio_player_var.speech_text_available.set()
+                self.global_vars.read_response = False          # (this one reply only)
+                if response_string:
+                    self.global_vars.audio_player_var.speech_text_available.set()
             if response_string:
                 on_response(response_string)
         except Exception as exception:
@@ -69,29 +71,33 @@ class DesktopWorkflowService:
     def run_summary_workflow(self, summarize_fn, on_loading, on_close, on_message):
         """Run summary generation and route status updates through callbacks."""
         try:
-            on_loading("Summary", "Creating a summary")
+            on_loading("Summary", "Creating a summary…")
             summary = summarize_fn()
             on_close()
-            if summary is None:
+            if not summary:
                 on_message("Summary", SUMMARY_FAILURE_MESSAGE)
                 return
 
             on_message("Summary", summary)
         except Exception as exception:
+            # The responder words its errors for the user (no key, no internet, nothing said yet).
             logger.error(f"Error in summarize_threaded: {exception}")
+            on_close()
+            on_message("Summary", str(exception) or SUMMARY_FAILURE_MESSAGE)
 
-    def start_word_cloud_workflow(self, words_provider, on_close, on_word_cloud, thread_name: str):
+    def start_word_cloud_workflow(self, words_provider, on_close, on_word_cloud, thread_name: str,
+                                  on_error=None):
         """Start the word cloud workflow in a background thread."""
         word_cloud_thread = self.thread_factory(
             target=self.run_word_cloud_workflow,
             name=thread_name,
-            args=(words_provider, on_close, on_word_cloud),
+            args=(words_provider, on_close, on_word_cloud, on_error),
         )
         word_cloud_thread.daemon = True
         word_cloud_thread.start()
         return True
 
-    def run_word_cloud_workflow(self, words_provider, on_close, on_word_cloud):
+    def run_word_cloud_workflow(self, words_provider, on_close, on_word_cloud, on_error=None):
         """Run word cloud generation and emit the rendered cloud through a callback."""
         try:
             on_close()
@@ -100,3 +106,5 @@ class DesktopWorkflowService:
             on_word_cloud("Word Cloud", word_cloud)
         except Exception as exception:
             logger.error(f"Error in word_cloud_threaded: {exception}")
+            if on_error is not None:
+                on_error("There are not enough words in the conversation yet for a word cloud.")

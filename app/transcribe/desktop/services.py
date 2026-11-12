@@ -7,9 +7,8 @@ import re
 import webbrowser
 
 import pyperclip
-from wordcloud import WordCloud
 
-from .. import constants
+from .. import prompts
 
 from tsutils import configuration, utilities
 
@@ -52,41 +51,36 @@ class SettingsService:
         self.config_factory = config_factory
         self.utcnow_provider = utcnow_provider
 
+    def save_value(self, section: str, key: str, value):
+        """Persist one setting."""
+        self.config_factory().add_override_value({section: {key: value}})
+
     def save_llm_response_interval(self, slider_value) -> int:
         """Persist the LLM response interval."""
         interval = int(slider_value)
-        config_obj = self.config_factory()
-        config_obj.add_override_value({"General": {"llm_response_interval": interval}})
+        self.save_value("General", "llm_response_interval", interval)
         return interval
 
     def save_audio_language(self, lang: str, transcriber):
         """Persist the STT language and update the live model."""
         transcriber.set_language(lang)
-        config_obj = self.config_factory()
-        config_obj.add_override_value({"OpenAI": {"audio_lang": lang}})
-
-    def build_response_prompt(self, system_prompt: str, response_lang: str | None) -> str:
-        """Build the system prompt for the chosen response language."""
-        if response_lang is None:
-            return system_prompt
-        return f"{system_prompt}.  Respond exclusively in {response_lang}."
+        self.save_value("OpenAI", "audio_lang", lang)
 
     def save_response_language(self, lang: str, convo):
         """Persist the response language and update the active system prompt."""
-        config_obj = self.config_factory()
-        config_obj.add_override_value({"OpenAI": {"response_lang": lang}})
-        config_data = config_obj.data
+        self.save_value("OpenAI", "response_lang", lang)
+        convo.refresh_system_prompt()
 
-        prompt = self.build_response_prompt(
-            system_prompt=config_data["General"]["system_prompt"],
-            response_lang=config_data["OpenAI"]["response_lang"],
-        )
-        convo.update_conversation(
-            persona=constants.PERSONA_SYSTEM,
-            text=prompt,
-            time_spoken=self.utcnow_provider(),
-            update_previous=True,
-        )
+
+def format_transcript(raw_transcript: str) -> str:
+    """'You: [text]' rows (as the conversation stores them) -> readable 'You: text' lines."""
+    lines = []
+    for row in raw_transcript.split("\n"):
+        if not row.strip():
+            continue
+        persona, text = prompts.split_row(row)
+        lines.append(f"{persona}: {text}" if persona else text)
+    return "\n\n".join(lines) + ("\n" if lines else "")
 
 
 class TranscriptIOService:
@@ -120,20 +114,24 @@ class BrowserService:
 class ConversationInsightsService:
     """Create derived desktop artifacts from conversation text."""
 
-    def __init__(self, word_cloud_factory=WordCloud):
+    def __init__(self, word_cloud_factory=None):
+        # (wordcloud is imported when first used: it loads slowly and most sessions never need it)
         self.word_cloud_factory = word_cloud_factory
 
     def normalize_word_cloud_text(self, words: str) -> str:
         """Strip persona labels before generating a word cloud."""
-        return re.sub(r"^(You|Speaker|assistant):\s*", "", words, flags=re.MULTILINE)
+        return re.sub(r"^(You|Speaker|assistant):\s*\[?|\]$", "", words, flags=re.MULTILINE)
 
     def build_word_cloud(self, words: str):
         """Create a word cloud from conversation text."""
         processed_text = self.normalize_word_cloud_text(words)
+        if self.word_cloud_factory is None:
+            from wordcloud import WordCloud  # pylint: disable=import-outside-toplevel
+            self.word_cloud_factory = WordCloud
         word_cloud = self.word_cloud_factory(
             background_color="white",
             colormap="binary",
             width=500,
             height=500,
         )
-        return word_cloud.generate(processed_text[80:])
+        return word_cloud.generate(processed_text)

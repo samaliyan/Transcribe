@@ -54,17 +54,6 @@ class AppRuntime:
         self.task_worker = task_queue.TaskQueue()
         self.data_dir = utilities.get_data_path(app_name="Transcribe")
 
-        zip_file_name = utilities.incrementing_filename(
-            filename=f"{self.data_dir}/logs/transcript",
-            extension="zip",
-        )
-        zip_params = {
-            "task_type": task_queue.TaskQueueEnum.ZIP_TASK,
-            "folder_path": f"{self.data_dir}/logs",
-            "zip_file_name": zip_file_name,
-            "skip_zip_files": True,
-        }
-        self.task_worker.add(**zip_params)
         self.current_working_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
         utilities.ensure_directory_exists(f"{self.data_dir}/logs")
