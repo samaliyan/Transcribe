@@ -33,7 +33,9 @@ def _to_float_mono(data: bytes, sample_width: int, channels: int) -> np.ndarray:
         samples -= 128.0                       # 8-bit WAV data is unsigned
     samples /= _SCALE[sample_width]
     if channels > 1:
-        samples = samples.reshape(-1, channels).mean(axis=1)
+        # Speech is in the front left/right pair; averaging in the (mostly silent) other
+        # channels of a 5.1 / 7.1 device would only make it quieter.
+        samples = samples.reshape(-1, channels)[:, :2].mean(axis=1)
     return samples
 
 

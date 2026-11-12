@@ -16,6 +16,11 @@ from tsutils import configuration  # noqa: E402 pylint: disable=C0413
 sys.path.append('../..')
 
 ENERGY_THRESHOLD = 1000
+# The microphone's threshold is measured for one second when it is opened; whatever happens in
+# that second (someone talking, or complete silence), it stays within these limits.
+MIN_ENERGY_THRESHOLD = 300
+# What the computer plays has no room noise: quiet remote voices must still start a phrase.
+SPEAKER_ENERGY_THRESHOLD = 300
 DYNAMIC_ENERGY_THRESHOLD = False
 
 logger = al.get_module_logger(al.AUDIO_RECORDER_LOGGER)
@@ -96,11 +101,12 @@ def print_detailed_audio_info(print_func=print):
 class BaseRecorder:
     """Base class for Speaker, Microphone classes
     """
+    START_ENERGY_THRESHOLD = ENERGY_THRESHOLD
 
     def __init__(self, source, source_name, audio_file_name: str = None, keep_audio_file: bool = False):
         logger.info(BaseRecorder.__name__)
         self.recorder = sr.Recognizer()
-        self.recorder.energy_threshold = ENERGY_THRESHOLD
+        self.recorder.energy_threshold = self.START_ENERGY_THRESHOLD
         self.recorder.dynamic_energy_threshold = DYNAMIC_ENERGY_THRESHOLD
         # Determines if this device is being used for transcription
         self.enabled: bool = True
@@ -112,6 +118,9 @@ class BaseRecorder:
         self.source_name: str = source_name
         self.config = configuration.Config().data
         self.stop_record_func = None
+        # A recording of everything captured is kept only when the settings ask for it.
+        if not self.config["General"].get("save_audio_log", False):
+            audio_file_name = None
         self.audio_file_name = audio_file_name
         # (sample_rate, sample_width, channels) of the data written to audio_file_name.
         self._saved_format = None
@@ -150,6 +159,8 @@ class BaseRecorder:
                 # (the audio library reports the cause on the console; say it plainly here)
                 raise OSError(f"{device_name} could not be opened")
             self.recorder.adjust_for_ambient_noise(self.source)
+        self.recorder.energy_threshold = min(max(self.recorder.energy_threshold, MIN_ENERGY_THRESHOLD),
+                                             ENERGY_THRESHOLD)
         print(f"[INFO] Completed ambient noise adjustment for {device_name}.")
 
     def record_audio(self, audio_queue: queue.Queue):
@@ -244,8 +255,13 @@ class BaseRecorder:
             except (queue.Empty, queue.Full):
                 logger.warning("Audio ingress buffer remained full for %s; newest block was dropped", self.source_name)
         if self.audio_file_name:
-            with open(file=self.audio_file_name+'.bak', mode='ab') as file_handle:
-                file_handle.write(data)
+            try:
+                with open(file=self.audio_file_name+'.bak', mode='ab') as file_handle:
+                    file_handle.write(data)
+            except OSError as exception:
+                # A full disk or a locked file must not stop the capture itself.
+                logger.error("Recording to %s stopped: %s", self.audio_file_name, exception)
+                self.audio_file_name = None
 
     def write_wav_data_to_file(self) -> str:
         """Write the raw input data into a wave file
@@ -259,15 +275,20 @@ class BaseRecorder:
         frame_rate, sample_width, channels = self._saved_format or (
             self.source.SAMPLE_RATE, self.source.SAMPLE_WIDTH, self.source.channels)
 
-        with open(file=self.audio_file_name+'.bak', mode='rb') as input_file_handle:
-            data = input_file_handle.read()
-
-        with wave.open(self.audio_file_name, 'wb') as wf:
-            # print(f'{datetime.datetime.now()} - Writing speaker data into file: {file_path}')
-            wf.setnchannels(channels)    # pylint: disable=E1101
-            wf.setsampwidth(sample_width)    # pylint: disable=E1101
-            wf.setframerate(frame_rate)    # pylint: disable=E1101
-            wf.writeframes(data)    # pylint: disable=E1101
+        try:
+            with open(file=self.audio_file_name+'.bak', mode='rb') as input_file_handle, \
+                    wave.open(self.audio_file_name, 'wb') as wf:
+                wf.setnchannels(channels)    # pylint: disable=E1101
+                wf.setsampwidth(sample_width)    # pylint: disable=E1101
+                wf.setframerate(frame_rate)    # pylint: disable=E1101
+                while True:                  # in blocks: a long recording does not fit in memory
+                    block = input_file_handle.read(1 << 20)
+                    if not block:
+                        break
+                    wf.writeframes(block)    # pylint: disable=E1101
+            os.remove(self.audio_file_name+'.bak')
+        except OSError as exception:
+            logger.error("Could not write %s: %s", self.audio_file_name, exception)
             # print(f'datasize: {len(data)}')
         # print(f'filesize: {os.path.getsize(self.audio_file_name)}')
 
@@ -390,6 +411,7 @@ def loopback_source(device: dict):
 class SpeakerRecorder(BaseRecorder):
     """Encapsultes the Speaer device audio input
     """
+    START_ENERGY_THRESHOLD = SPEAKER_ENERGY_THRESHOLD
     def __init__(self, source_name='Speaker', audio_file_name: str = None, device: dict = None,
                  keep_audio_file: bool = False):
         logger.info(SpeakerRecorder.__name__)

@@ -3,6 +3,7 @@ name: Windows package
 # - A merge into main (a change to the program) builds, tests and publishes the next version by
 #   itself: 1.0.2 after 1.0.1. Changes to documentation only publish nothing.
 # - Every push to another branch builds and tests the package; nothing is published.
+# - build/next-version.txt can name the next version when it is a bigger step (e.g. 2.0.0).
 # - "Run workflow" publishes a version number you choose (for example 1.1.0 or 2.0.0);
 #   left empty, it is the next one like a merge.
 on:
@@ -45,6 +46,14 @@ jobs:
         run: |
           git fetch --tags --force --quiet
           VERSION="${VERSION#v}"
+          # build/next-version.txt names the number of the next release when it is a bigger
+          # step (2.0.0); once that version exists, numbering continues by itself (2.0.1).
+          if [ -z "$VERSION" ] && [ -f build/next-version.txt ]; then
+            wanted=$(tr -d ' \r\n' < build/next-version.txt); wanted="${wanted#v}"
+            if [[ "$wanted" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! git rev-parse "v$wanted" >/dev/null 2>&1; then
+              VERSION="$wanted"
+            fi
+          fi
           if [ -z "$VERSION" ]; then
             last=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
             last="${last#v}"; last="${last:-1.0.0}"
@@ -73,7 +82,8 @@ jobs:
       - name: Check the package contents
         shell: bash
         run: |
-          for f in Transcribe.exe parameters.yaml override.yaml version.txt bin/README.md; do
+          for f in Transcribe.exe parameters.yaml override.yaml version.txt bin/README.md README.txt \
+                   models/faster-whisper-base/model.bin models/faster-whisper-base/tokenizer.json; do
             test -f "dist/Transcribe/$f" || { echo "::error::Missing in package: $f"; exit 1; }
           done
           ls dist/Transcribe/_internal/customtkinter/assets/themes/blue.json >/dev/null \
@@ -97,6 +107,9 @@ jobs:
           timeout 240 ./Transcribe.exe -t "$GITHUB_WORKSPACE/tests/english.wav" -m tiny -o sample.txt > run.txt 2>&1 || true
           cat run.txt
           test -s sample.txt || { echo "::error::The exe did not transcribe the sample file"; exit 1; }
+          if grep -q "Voice activity filter is off" run.txt; then
+            echo "::error::The voice activity filter does not work in the package"; exit 1
+          fi
           cat sample.txt
           tr -d '[:punct:]' < sample.txt | tr 'A-Z' 'a-z' | grep -Eq "(1|one).*(2|two).*(3|three)" \
             || { echo "::error::Unexpected transcription"; exit 1; }
@@ -166,8 +179,9 @@ jobs:
           ## Download
 
           **$(basename "$zip")** below: unzip it and double-click **Transcribe.exe** (Windows 10/11, 64-bit).
-          The first start downloads the speech to text model once (internet needed).
-          To use an OpenAI API key, put it in \`override.yaml\` next to the exe.
+          Transcription works at once and without internet (the speech to text model is included).
+          For suggested replies, enter the API key of your AI provider in **Settings**.
+          When updating, copy your \`override.yaml\` (your settings) into the new folder.
 
           NOTES
           gh release create "v$VERSION" "$zip" --target "$GITHUB_SHA" --title "Transcribe $VERSION" \

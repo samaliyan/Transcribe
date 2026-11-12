@@ -7,8 +7,6 @@ import openai
 from appdirs import user_data_dir
 import time
 
-valid_api_key: bool = False
-
 
 def merge(first: dict, second: dict, path=[]):
     """Recursively merge two dictionaries.
@@ -209,61 +207,6 @@ def get_available_models(client: openai.OpenAI) -> list:
         return None
 
     return sorted(return_val)
-
-
-def is_api_key_valid(api_key: str, base_url: str, model: str) -> bool:
-    """Check if it is valid openai compatible openai key for the provider
-    """
-
-    global valid_api_key  # pylint: disable=W0603
-
-    if valid_api_key:
-        return True
-
-    if api_key == 'API_KEY':  # This is the default value
-        return False
-
-    openai.api_key = api_key
-    client = openai.OpenAI(api_key=api_key, base_url=base_url)
-
-    try:
-        # Ideally models list is the best way to determine if api key is valid
-        # Some of the OpenAI compatible vendors do not support all the methods though
-        # client.models.list()
-        completion_args = {
-            'messages': [
-                {
-                    'role': 'system',
-                    'content': 'You are an AI assistant',
-                },
-                {
-                    'role': 'user',
-                    'content': 'Are you online',
-                }
-            ],
-            'model': model,
-        }
-
-        normalized_model = model.lower()
-        modern_token_limit_prefixes = ('gpt-5', 'o1', 'o3', 'o4')
-        if normalized_model.startswith(modern_token_limit_prefixes):
-            completion_args['max_completion_tokens'] = 1024
-        else:
-            # Preserve compatibility with older OpenAI-compatible providers.
-            completion_args['max_tokens'] = 1024
-
-        chat_completion = client.chat.completions.create(**completion_args)
-        assert len(chat_completion.choices[0].message.content) > 0
-        client.close()
-    except openai.AuthenticationError as e:
-        print(e)
-        return False
-    except openai.OpenAIError as e:
-        print(e)
-        return False
-
-    valid_api_key = True
-    return True
 
 
 def ensure_directory_exists(directory_path: str):

@@ -7,19 +7,15 @@ import subprocess  # nosec
 import tempfile
 from sdk import transcriber_models as tm
 
-from ..audio_transcriber import DeepgramTranscriber, WhisperCPPTranscriber, WhisperTranscriber
+from ..audio_transcriber import DeepgramTranscriber, WhisperCPPTranscriber, WhisperTranscriber, language_code
 from ..openai_realtime_transcriber import OpenAIRealtimeTranscriber
 
-from tsutils import language, utilities
+from tsutils import utilities
 
 
 def get_language_code(lang: str) -> str:
-    """Get the language code from the configured language label."""
-    lang_lower = lang.lower()
-    try:
-        return next(key for key, value in language.LANGUAGES_DICT.items() if value == lang_lower)
-    except StopIteration:
-        return "en"
+    """Get the language code from the configured language label ('' = detect)."""
+    return language_code(lang)
 
 
 def ensure_ffmpeg_available():
@@ -93,6 +89,7 @@ def create_stt_model(name: str, config: dict, api: bool, background: bool = Fals
     if name.lower() == "whisper" and api:
         stt_model_config = {
             "api_key": config["OpenAI"]["api_key"],
+            "base_url": config["OpenAI"].get("base_url"),
             "timeout": config["OpenAI"]["response_request_timeout_seconds"],
             "model": config["OpenAI"].get("stt_model") or "whisper-1",
             "audio_lang": get_language_code(config["OpenAI"]["audio_lang"]),

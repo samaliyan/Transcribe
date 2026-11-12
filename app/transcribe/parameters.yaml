@@ -21,7 +21,7 @@ OpenAI:
   stt_model: whisper-1
 
 # Request timeout for any response requests made to openAI API
-  response_request_timeout_seconds: 10
+  response_request_timeout_seconds: 20
 
 # Summarize request timeout for any response requests made to openAI API
   summarize_request_timeout_seconds: 30
@@ -137,36 +137,33 @@ General:
   chat_inference_provider: openai
 
 
-# These are used for single turn, selected text responses only.
-  default_prompt_preamble: "You are a casual pal, genuinely interested in the conversation at hand. A poor transcription of conversation is given below. "
-  default_prompt_epilogue: "Please respond, in detail, to the conversation. Confidently give a straightforward response to the speaker, even if you don't understand them. Give your response in square brackets. DO NOT ask to repeat, and DO NOT ask for clarification. Just answer the speaker directly."
-# The combination of system_prompt, initial_convo is used to create a multi turn prompt message for LLM.
-# system_prompt_1, systen_prompt_2 are here as samples of other possible prompts.
-# Only the content of system_prompt parameter will be used
-  system_prompt: "You are a casual pal, genuinely interested in the conversation at hand. Please respond, in detail, to the conversation. Confidently give a straightforward response to the speaker, even if you don't understand them. Give your response in square brackets. DO NOT ask to repeat, and DO NOT ask for clarification. Just answer the speaker directly."
-#  system_prompt: "You are an expert at Basketball and helping others learn about basketball. Please respond, in detail, to the conversation. Confidently give a straightforward response to the speaker, even if you don't understand them. Give your response in square brackets. DO NOT ask to repeat, and DO NOT ask for clarification. Just answer the speaker directly."
-#  system_prompt: "You are an expert at Fantasy Football and helping others learn about Fantasy football. Please respond, in detail, to the conversation. Confidently give a straightforward response to the speaker, even if you don't understand them. Give your response in square brackets. DO NOT ask to repeat, and DO NOT ask for clarification. Just answer the speaker directly."
-#  system_prompt: “You are an expert Agile Coach and are interviewing for a position. Respond in detail to the conversation. Confidently give a straightforward response to the speaker, even if you don't understand them. Give your response in square brackets. DO NOT ask to repeat, and DO NOT ask for clarification. Just answer the speaker directly."
+# Used around the text when a reply is asked for text selected in the transcript
+# (More > Reply to the selected text). Both can be empty.
+  default_prompt_preamble: "Reply to this part of the conversation:"
+  default_prompt_epilogue: ""
+# What the assistant is told to do. It can be changed in the program: Settings > Assistant,
+# which also offers other ready-made roles (job interview, explaining, casual conversation).
+  system_prompt: "You are my real-time assistant during a live conversation (a meeting, a call or an interview). You receive a rough automatic transcript: lines marked 'Me' are what I said, lines marked 'Other' are what the other people said. It can contain recognition mistakes; work out what was meant. Give me what I should say next, or the answer to the latest question from the others. Be correct and specific, and short enough to read at a glance: a few sentences or short bullet points. Never ask me to repeat or clarify, and do not describe or summarize the transcript."
 
-  summary_prompt: 'Create a summary of the following text'
+  summary_prompt: 'Summarize this conversation: the main points, any decisions, and what each side still has to do.'
 
-# When we anticipate to talk about a specific topic, seed the content with some conversation
-# Application expects role "You" to have 1 entry
-# If the conversation is generic, replace this text with something like this.
-#   role: You
-#   content: I am V, I want to have a casual friendly conversation
-#   role: assistant
-#   content: Hello V, That's awesome! Glad to meet you and I am looking forward to our conversation today
-  initial_convo:
-    first:
-      role: "You"
-      # content: "I am V, I want to learn about Fantasy Football"
-      # content: "I am V, I want to learn about Basketball"
-      # content: "Hey assistant, how are you doing today, I want to talk about Agile coaching today."
-      content: Hey assistant, how are you doing today, I am in mood of a casual conversation.
-    second:
-      role: "assistant"
-      # content: "Hello, V. That's awesome! What do you want to know about basketball"
-      # content: "Hello, V. That's awesome! What do you want to know about Fantasy Football"
-      # content: "Hello, V. You are awesome. I am doing very well and looking forward to discussion about Agile coaching."
-      content: "Hello, V. You are awesome. I am doing very well and looking forward to some light hearted banter with you."
+# Optional: text the conversation starts with, before anything is said (for example who you
+# are and what the meeting is about). Usually it is simpler to add that to system_prompt.
+#   initial_convo:
+#     first:
+#       role: "You"
+#       content: "I am V, a backend developer, in an interview for a senior position."
+#     second:
+#       role: "assistant"
+#       content: "Understood."
+  initial_convo: {}
+
+# Keep a sound recording (logs/mic.wav, logs/speaker.wav) of each session. Large files.
+  save_audio_log: No
+# Optional proxy for the AI provider and model downloads, e.g. http://127.0.0.1:8080
+# Empty: the Windows proxy settings are used.
+  proxy: ''
+# Window: text size of the transcript and the reply, stay above other windows, last size.
+  ui_font_size: 14
+  always_on_top: No
+  window_geometry: ''

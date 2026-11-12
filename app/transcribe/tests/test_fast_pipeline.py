@@ -395,7 +395,8 @@ class TestTranscriberSafety(unittest.TestCase):
         model = ScriptedModel()
         model.set_lang = MagicMock()
         transcriber, _ = make_transcriber(model)
-        for given, expected in (("English", "en"), ("german", "de"), ("fa", "fa"), ("Klingon", "Klingon")):
+        for given, expected in (("English", "en"), ("german", "de"), ("fa", "fa"), ("Farsi", "fa"), ("Hebrew", "he"),
+                                ("Klingon", "")):
             transcriber.set_language(given)
             self.assertEqual(model.set_lang.call_args.args[0], expected)
 
@@ -548,11 +549,12 @@ class TestModelsTakeAudioFromMemory(unittest.TestCase):
         model.transcribe_pcm(pcm(1))
         self.assertNotIn("language", model.stt_client.audio.transcriptions.create.call_args.kwargs)
 
-    def test_api_failure_returns_empty(self):
+    def test_api_failure_reaches_the_caller(self):
         model = tm.APIWhisperSTTModel({"api_key": "k", "timeout": 7, "audio_lang": "en"})
         model.stt_client = MagicMock()
         model.stt_client.audio.transcriptions.create.side_effect = RuntimeError("offline")
-        self.assertEqual(model.transcribe_pcm(pcm(1)), "")
+        with self.assertRaises(RuntimeError):       # (the live transcriber shows it to the user)
+            model.transcribe_pcm(pcm(1))
 
     def test_faster_whisper_is_used_when_installed(self):
         calls = {}
@@ -826,6 +828,7 @@ class TestEventDrivenResponses(unittest.TestCase):
         from app.transcribe.gpt_responder import GPTResponder
         responder = GPTResponder.__new__(GPTResponder)
         responder.enabled = True
+        responder.llm_client = object()
         responder.llm_response_interval = interval
         responder.calls = []
         responder.generate_response_from_transcript = lambda: responder.calls.append(time.monotonic())
@@ -916,11 +919,12 @@ class TestDisplayRows(unittest.TestCase):
         self.assertIn(("release", first_key), self.widget.calls)
         self.assertEqual([row[1] for row in self.widget.rows], ["You: [one]\n", "You: [two!]\n"])
 
-    def test_untracked_rows_fall_back_and_reset_forgets_rows(self):
+    def test_after_a_reset_an_update_starts_a_new_row(self):
         self.manager.add_transcript_line("You: [one]\n", "You")
         self.manager.reset_rows()
+        self.widget.rows.clear()
         self.manager.update_last_row("You", "You: [x]\n")
-        self.assertIn(("delete", "You"), self.widget.calls)
+        self.assertEqual([row[1] for row in self.widget.rows], ["You: [x]\n"])
         self.manager.add_transcript_line("plain line\n")
         self.assertEqual(self.widget.calls[-1], ("add", "plain line\n"))
 
@@ -935,18 +939,14 @@ class TestDisplayRows(unittest.TestCase):
         self.assertEqual([row[1] for row in self.widget.rows], ["You: [new]\n"])
 
     def test_response_box_is_rewritten_only_when_the_text_changes(self):
-        textbox = MagicMock()
-        textbox.tag_ranges.return_value = ()
-        slider = SimpleNamespace(get=lambda: 5)
-        responder = SimpleNamespace(response="answer", update_response_interval=lambda value: None)
-        runtime = SimpleNamespace(responder=SimpleNamespace(enabled=True), update_response_now=False,
-                                  previous_response=None)
-        for _ in range(3):
-            self.manager.update_response_ui(responder, textbox, MagicMock(), slider, runtime)
-        self.assertEqual(textbox.insert.call_count, 1)
-        responder.response = "answer, longer"
-        self.manager.update_response_ui(responder, textbox, MagicMock(), slider, runtime)
-        self.assertEqual(textbox.insert.call_args.args, ("0.0", "answer, longer"))
+        from app.transcribe.desktop import display
+        rendered = []
+        self.manager.ui.response_textbox = object()
+        with patch.object(display, "render_reply", lambda widget, text: rendered.append(text)):
+            for _ in range(3):
+                self.manager.write_response_text("[answer]")
+            self.manager.write_response_text("answer, longer")
+        self.assertEqual(rendered, ["answer", "answer, longer"])       # (old-style brackets removed)
 
 
 if __name__ == "__main__":
@@ -1133,7 +1133,9 @@ class TestFastStart(unittest.TestCase):
             model = tm.WhisperSTTModel(self.config(), background=True)
             self.assertTrue(model._loaded.wait(3))
             self.assertIn("internet", model.load_state)
-            self.assertEqual(model.transcribe_pcm(pcm(1)), "")
+            with self.assertRaises(RuntimeError) as raised:
+                model.transcribe_pcm(pcm(1))
+            self.assertIn("internet", str(raised.exception))
 
     def test_the_live_transcriber_asks_for_a_background_load(self):
         from app.transcribe.providers import stt
@@ -1143,23 +1145,23 @@ class TestFastStart(unittest.TestCase):
                                  api=False, background=True)
         self.assertTrue(factory.call_args.kwargs["stt_model_config"]["background"])
 
-    def test_window_title_follows_the_model(self):
-        from app.transcribe.appui import AppUI
-        ui = AppUI.__new__(AppUI)
+    def test_status_follows_the_model(self):
+        from app.transcribe.desktop.display import stt_status
         model = SimpleNamespace(load_state="loading")
-        ui.global_vars = SimpleNamespace(transcriber=SimpleNamespace(stt_model=model))
-        titles, popups, timers = [], [], []
-        ui.title = titles.append
-        ui.after = lambda ms, fn: timers.append(fn)
-        ui.display_manager = SimpleNamespace(show_message_popup=lambda *a: popups.append(a))
-        ui.show_model_status()
+        runtime = SimpleNamespace(transcriber=SimpleNamespace(stt_model=model, last_error=None, transcribe=True))
+        self.assertIn("Loading", stt_status(runtime)[0])
         model.load_state = "ready"
-        timers.pop()()
-        self.assertEqual(titles, ["Transcribe - loading the speech to text model...", "Transcribe"])
-        model.load_state = "no internet"
-        ui.show_model_status()
-        self.assertEqual(popups, [("Speech to text", "no internet")])
-
+        self.assertEqual(stt_status(runtime)[0], "Listening")
+        model.load_state = "no internet."
+        text, _colour, notice = stt_status(runtime)
+        self.assertIn("not working", text)
+        self.assertIn("no internet.", notice)
+        model.load_state = "ready"
+        runtime.transcriber.last_error = "Speech to text: the API key was rejected."
+        self.assertEqual(stt_status(runtime)[2], "Speech to text: the API key was rejected.")
+        runtime.transcriber.last_error = None
+        runtime.transcriber.transcribe = False
+        self.assertEqual(stt_status(runtime)[0], "Paused")
 
 
 class FakeStream:

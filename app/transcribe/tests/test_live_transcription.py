@@ -35,7 +35,7 @@ class TestLiveTranscriptManager(unittest.TestCase):
         )
         second = self.manager.process_hypothesis(
             "You",
-            hypothesis("world again"),
+            hypothesis("world again", start=3.0),      # the rolling window moved on
             new_phrase=False,
         )
 
@@ -146,11 +146,25 @@ class TestLiveTranscriptManager(unittest.TestCase):
         self.manager.process_hypothesis("You", hypothesis("hello world"), new_phrase=True)
         self.manager.process_hypothesis("Speaker", hypothesis("different start"), new_phrase=True)
 
-        you_update = self.manager.process_hypothesis("You", hypothesis("world again"), new_phrase=False)
-        speaker_update = self.manager.process_hypothesis("Speaker", hypothesis("start here"), new_phrase=False)
+        you_update = self.manager.process_hypothesis("You", hypothesis("world again", start=3.0), new_phrase=False)
+        speaker_update = self.manager.process_hypothesis(
+            "Speaker", hypothesis("start here", start=3.0), new_phrase=False)
 
         self.assertEqual(you_update.text, "hello world again")
         self.assertEqual(speaker_update.text, "different start here")
+
+    def test_a_new_pass_over_the_same_audio_replaces_the_row(self):
+        """Words the model corrected must not stay in the row next to their correction."""
+        self.manager.process_hypothesis("Speaker", hypothesis("I scream for the"), new_phrase=True)
+        update = self.manager.process_hypothesis(
+            "Speaker", hypothesis("Ice cream for the kids is in the fridge"), new_phrase=False)
+        self.assertEqual(update.text, "Ice cream for the kids is in the fridge")
+        self.assertTrue(update.update_previous)
+
+        self.manager.process_hypothesis("You", hypothesis("سلام خوبی"), new_phrase=True)
+        update = self.manager.process_hypothesis(
+            "You", hypothesis("سلام، خوبید؟ امروز جلسه داریم"), new_phrase=False)
+        self.assertEqual(update.text, "سلام، خوبید؟ امروز جلسه داریم")
 
     def test_clear_resets_all_state(self):
         self.manager.process_hypothesis("You", hypothesis("hello world"), new_phrase=True)

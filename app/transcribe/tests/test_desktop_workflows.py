@@ -84,7 +84,7 @@ class TestDesktopWorkflowService(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                ("loading", "Summary", "Creating a summary"),
+                ("loading", "Summary", "Creating a summary…"),
                 ("close",),
                 ("message", "Summary", "summary text"),
             ],

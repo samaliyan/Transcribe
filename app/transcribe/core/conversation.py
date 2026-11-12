@@ -8,7 +8,7 @@ import sys
 import threading
 from pathlib import Path
 
-from .. import constants
+from .. import constants, prompts
 from ..db import AppDB as appdb
 from ..db import conversation as convodb
 from ..db import llm_responses as llmrdb
@@ -41,6 +41,8 @@ class Conversation:
         self._lock = threading.RLock()
         # Database id of each persona's newest row, so an update does not need a SELECT first.
         self._last_convo_id: dict[str, int | None] = {}
+        # Rows per persona that come from the settings (initial_convo), not from the conversation.
+        self._seed_counts: dict[str, int] = {}
         self.initialize_conversation()
 
     def set_handlers(self, update, insert, partial=None, finalize_partial=None):
@@ -52,31 +54,45 @@ class Conversation:
             self.finalize_partial_handler = finalize_partial
 
     def initialize_conversation(self):
-        """Populate the initial system prompt and seed conversation."""
+        """Populate the system prompt and the optional seed conversation from the settings."""
         self.config = configuration.Config(
             default_config_filename=str(APP_DIR / "parameters.yaml"),
             override_config_filename=str(APP_DIR / "override.yaml"),
         ).data
-        prompt = self.config["General"]["system_prompt"]
-        response_lang = self.config["OpenAI"]["response_lang"]
-        if response_lang is not None:
-            prompt += f".  Respond exclusively in {response_lang}."
-
         self.update_conversation(
             persona=constants.PERSONA_SYSTEM,
-            text=prompt,
+            text=self._system_prompt(),
             time_spoken=datetime.datetime.utcnow(),
         )
-        initial_convo: dict = self.config["General"]["initial_convo"]
-        for _, value in initial_convo.items():
+        initial_convo = self.config["General"].get("initial_convo") or {}
+        for value in initial_convo.values():
+            role, content = (value or {}).get("role"), (value or {}).get("content")
+            if role not in self.transcript_data or not content:
+                continue
             self.update_conversation(
-                persona=value["role"],
-                text=value["content"],
+                persona=role,
+                text=content,
                 time_spoken=datetime.datetime.utcnow(),
             )
         with self._lock:
+            self._seed_counts = {persona: len(rows) for persona, rows in self.transcript_data.items()}
             self.last_update = datetime.datetime.utcnow()
             self._initialized = True
+
+    def _system_prompt(self) -> str:
+        return prompts.with_response_language(
+            self.config["General"]["system_prompt"], self.config["OpenAI"]["response_lang"])
+
+    def refresh_system_prompt(self):
+        """Apply a system prompt or reply language that was changed in the settings."""
+        with self._lock:
+            rows = self.transcript_data[constants.PERSONA_SYSTEM]
+            time_spoken = rows[0][1] if rows else datetime.datetime.utcnow()
+            row = (f"{constants.PERSONA_SYSTEM}: [{self._system_prompt()}]\n\n", time_spoken, None)
+            if rows:
+                rows[0] = row
+            else:
+                rows.append(row)
 
     def clear_conversation_data(self):
         """Clear all conversation data and restore initial prompts."""
@@ -84,6 +100,7 @@ class Conversation:
             for persona in self.transcript_data:
                 self.transcript_data[persona].clear()
             self._last_convo_id.clear()
+            self._seed_counts = {}
             self._initialized = False
         self.initialize_conversation()
 
@@ -135,13 +152,8 @@ class Conversation:
             convo_text = f"{persona}: [{text}]\n\n"
             ui_text = f"{persona}: [{text}]\n"
 
-            should_update_previous = (
-                update_previous
-                and (
-                    (persona.lower() == "you" and len(transcript) > 1)
-                    or (persona.lower() != "you" and len(transcript) > 0)
-                )
-            )
+            # A seed row from the settings is never replaced by live text.
+            should_update_previous = update_previous and len(transcript) > self._seed_counts.get(persona, 0)
 
             if should_update_previous:
                 prev_element = transcript.pop()
@@ -158,7 +170,12 @@ class Conversation:
                         callback_args = (persona, ui_text)
             else:
                 if self._initialized and persists and convo_object is not None:
-                    convo_id = convo_object.insert_conversation(inv_id, time_spoken, persona, text)
+                    try:
+                        convo_id = convo_object.insert_conversation(inv_id, time_spoken, persona, text)
+                    except Exception as exception:  # pylint: disable=broad-except
+                        # A database problem must not lose the row on screen.
+                        print(f"[WARN] The row could not be stored in the database: {exception}")
+                        convo_id = None
                     self._last_convo_id[persona] = convo_id
                     if replace_ui_partial and partial_id and self.finalize_partial_handler is not None:
                         callback = self.finalize_partial_handler
@@ -219,30 +236,25 @@ class Conversation:
             inv_id=inv_id,
         )
 
-    def on_convo_select(self, input_text: str):
-        """Callback when a specific conversation row is selected in the UI."""
-        end_speaker = input_text.find(":")
-        if end_speaker == -1:
-            self.context.previous_response = None
-            return
-
-        persona = input_text[:end_speaker].strip()
+    def get_response_for_row(self, persona: str, text: str) -> str | None:
+        """The suggestion that was given when this transcript row was the newest one, if any."""
+        wanted = f"{persona}: [{text}]"
         convo_id = None
         with self._lock:
-            transcript = self.transcript_data[persona]
-            for first, _, third in transcript:
-                if first.strip() == input_text.strip():
+            for first, _, third in self.transcript_data.get(persona, []):
+                if first.strip() == wanted:
                     convo_id = third
                     break
-
         if not convo_id:
-            self.context.previous_response = None
-            return
-
+            return None
         inv_id = appdb().get_invocation_id()
         llmr_object: llmrdb.LLMResponses = appdb().get_object(llmrdb.TABLE_NAME)
-        response = llmr_object.get_text_by_invocation_and_conversation(inv_id, convo_id)
-        self.context.previous_response = response if response else "No LLM response corresponding to this row"
+        return llmr_object.get_text_by_invocation_and_conversation(inv_id, convo_id) or None
+
+    def on_convo_select(self, input_text: str):
+        """Callback when a transcript row ('Persona: [text]') is selected in the UI."""
+        persona, text = prompts.split_row(input_text)
+        self.context.previous_response = self.get_response_for_row(persona, text) if persona else None
 
     def get_conversation(self, sources: list | None = None, length: int = 0) -> str:
         """Return a merged transcript for the requested personas."""
@@ -275,40 +287,41 @@ class Conversation:
             combined_transcript = combined_transcript[-length:]
             return "".join([t[0] for t in combined_transcript])
 
+    def _spoken_rows(self, length: int = 0) -> list:
+        """What was said (microphone and speakers, no seed rows), oldest first. Call with the lock held."""
+        rows = []
+        for persona in (constants.PERSONA_YOU, constants.PERSONA_SPEAKER):
+            rows += self.transcript_data[persona][self._seed_counts.get(persona, 0):]
+        rows.sort(key=lambda row: row[1])
+        return rows[-length:] if length else rows
+
+    def _seed_rows(self) -> list:
+        """The seed conversation from the settings, in the order You, assistant."""
+        rows = []
+        for persona in (constants.PERSONA_YOU, constants.PERSONA_ASSISTANT):
+            rows += self.transcript_data[persona][:self._seed_counts.get(persona, 0)]
+        return rows
+
+    def has_spoken_rows(self) -> bool:
+        """True when something was transcribed (there is something to answer or summarize)."""
+        with self._lock:
+            return bool(self._spoken_rows())
+
     def get_merged_conversation_summary(self, length: int = 0) -> list:
         """Return the conversation history formatted for summary prompts."""
         with self._lock:
-            combined_transcript = (
-                self.transcript_data[constants.PERSONA_YOU][-length:]
-                + self.transcript_data[constants.PERSONA_SPEAKER][-length:]
-                + self.transcript_data[constants.PERSONA_ASSISTANT][-length:]
-            )
-            sorted_transcript = sorted(combined_transcript, key=lambda x: x[1])
-            sorted_transcript = sorted_transcript[-length:]
-            sorted_transcript.insert(0, self.transcript_data[constants.PERSONA_YOU][0])
-            sorted_transcript.insert(
-                0,
-                (
-                    f"{constants.PERSONA_SYSTEM}: [{self.config['General']['summary_prompt']}]\n\n",
-                    datetime.datetime.now(),
-                    -1,
-                ),
-            )
-            return sorted_transcript
+            summary_prompt = prompts.with_response_language(
+                self.config["General"]["summary_prompt"], self.config["OpenAI"]["response_lang"])
+            system_row = (f"{constants.PERSONA_SYSTEM}: [{summary_prompt}]\n\n", datetime.datetime.now(), -1)
+            return [system_row] + self._spoken_rows(length)
 
     def get_merged_conversation_response(self, length: int = 0) -> list:
-        """Return the conversation history formatted for response prompts."""
+        """Return the system prompt and the newest ``length`` spoken rows for a reply request.
+
+        Earlier suggestions are left out: they were shown to the user, not said in the conversation.
+        """
         with self._lock:
-            combined_transcript = (
-                self.transcript_data[constants.PERSONA_YOU][-length:]
-                + self.transcript_data[constants.PERSONA_SPEAKER][-length:]
-                + self.transcript_data[constants.PERSONA_ASSISTANT][-length:]
-            )
-            sorted_transcript = sorted(combined_transcript, key=lambda x: x[1])
-            sorted_transcript = sorted_transcript[-length:]
-            sorted_transcript.insert(0, self.transcript_data[constants.PERSONA_YOU][0])
-            sorted_transcript.insert(0, self.transcript_data[constants.PERSONA_SYSTEM][0])
-            return sorted_transcript
+            return [self.transcript_data[constants.PERSONA_SYSTEM][0]] + self._seed_rows() + self._spoken_rows(length)
 
     def _pretty_print_transcript(self, message: list):
         """Print a conversation transcript in a human-friendly format."""

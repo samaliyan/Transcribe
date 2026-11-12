@@ -50,6 +50,8 @@ def run_pyinstaller():
         "--collect-data", "customtkinter",      # themes
         "--collect-data", "wordcloud",          # font and stop words
         "--collect-data", "faster_whisper",     # voice activity model
+        "--hidden-import", "onnxruntime",       # runs the voice activity model
+        "--collect-binaries", "onnxruntime",
         "--collect-binaries", "ctranslate2",    # the speech to text engine
         "--collect-all", "soundfile",           # libsndfile
         "--collect-all", "_soundfile_data",
@@ -59,6 +61,26 @@ def run_pyinstaller():
         "--exclude-module", "funasr",
         "--exclude-module", "torchaudio",
     ])
+
+
+BUNDLED_MODEL = "base"
+
+
+def add_model(folder: Path):
+    """Put the default speech to text model in the package, so the program works straight after
+    unzipping, without a download (and where Hugging Face cannot be reached)."""
+    from faster_whisper import download_model  # pylint: disable=import-outside-toplevel
+    target = folder / "models" / f"faster-whisper-{BUNDLED_MODEL}"
+    target.mkdir(parents=True, exist_ok=True)
+    download_model(BUNDLED_MODEL, output_dir=str(target))
+    # (only the model files: no download cache or links next to them)
+    for leftover in (target / ".cache", target / ".gitattributes", target / "README.md"):
+        if leftover.is_dir():
+            shutil.rmtree(leftover, ignore_errors=True)
+        elif leftover.exists():
+            leftover.unlink()
+    if not (target / "model.bin").is_file():
+        raise SystemExit(f"The speech to text model was not downloaded into {target}")
 
 
 def add_files(folder: Path, version: str):
@@ -71,11 +93,14 @@ def add_files(folder: Path, version: str):
     (folder / "README.txt").write_text(
         "Transcribe\n"
         "==========\n\n"
-        "1. Double-click Transcribe.exe.\n"
-        "2. The first time, the speech to text model is downloaded (an internet connection is needed once).\n"
-        "3. To use an OpenAI API key, put it in override.yaml, for example:\n\n"
-        "   OpenAI:\n"
-        "     api_key: 'sk-...'\n\n"
+        "1. Double-click Transcribe.exe. It starts writing down what you say (microphone) and what\n"
+        "   the others say (the sound of this computer) at once. No internet is needed for that.\n"
+        "2. For suggested replies and summaries: press Settings, enter the API key of your AI\n"
+        "   provider (and its address and model if it is not OpenAI), press Test, then Save.\n"
+        "3. F2 asks for a reply at any moment. F4 pauses. 'More' has 'Keep the window on top'.\n\n"
+        "The transcript of every session is saved when the program closes\n"
+        "(More > Open the folder with transcripts and logs).\n"
+        "Your settings are in override.yaml in this folder: keep that file when you update.\n\n"
         "More: https://github.com/samaliyan/transcribe\n",
         encoding="utf-8")
 
@@ -106,6 +131,7 @@ def main():
     run_pyinstaller()
     folder = DIST / NAME
     add_files(folder, version)
+    add_model(folder)
     archive = make_zip(folder, version)
     print(f"Package folder: {folder} ({folder_size_mb(folder):.0f} MB)")
     print(f"Zip: {archive} ({archive.stat().st_size / 1e6:.0f} MB)")

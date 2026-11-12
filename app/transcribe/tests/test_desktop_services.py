@@ -97,21 +97,12 @@ class TestSettingsService(unittest.TestCase):
             }
         )
         convo = MagicMock()
-        current_time = datetime.datetime(2026, 3, 14, 10, 30, 0)
-        service = SettingsService(
-            config_factory=lambda: fake_config,
-            utcnow_provider=lambda: current_time,
-        )
+        service = SettingsService(config_factory=lambda: fake_config)
 
-        service.save_response_language("spanish", convo)
+        service.save_response_language("Spanish", convo)
 
-        self.assertEqual(fake_config.override_values, [{"OpenAI": {"response_lang": "spanish"}}])
-        convo.update_conversation.assert_called_once_with(
-            persona="system",
-            text="You are helpful.  Respond exclusively in spanish.",
-            time_spoken=current_time,
-            update_previous=True,
-        )
+        self.assertEqual(fake_config.override_values, [{"OpenAI": {"response_lang": "Spanish"}}])
+        convo.refresh_system_prompt.assert_called_once_with()
 
 
 class TestTranscriptIOService(unittest.TestCase):
@@ -151,14 +142,19 @@ class TestConversationInsightsService(unittest.TestCase):
 
         self.assertEqual(normalized, "hi\nhello\nok")
 
-    def test_build_word_cloud_uses_normalized_text_tail(self):
+    def test_build_word_cloud_uses_the_spoken_text_without_labels(self):
         service = ConversationInsightsService(word_cloud_factory=FakeWordCloud)
-        words = "You: " + ("a" * 90)
 
-        word_cloud = service.build_word_cloud(words)
+        word_cloud = service.build_word_cloud("You: [hello there]\n\nSpeaker: [general kenobi]\n\n")
 
-        self.assertEqual(word_cloud.generated_text, "a" * 10)
+        self.assertEqual(word_cloud.generated_text, "hello there\n\ngeneral kenobi\n\n")
         self.assertEqual(word_cloud.kwargs["background_color"], "white")
+
+    def test_format_transcript_gives_readable_lines(self):
+        from app.transcribe.desktop.services import format_transcript
+        raw = "You: [hello]\n\nSpeaker: [سلام، خوبی؟]\n\n"
+        self.assertEqual(format_transcript(raw), "You: hello\n\nSpeaker: سلام، خوبی؟\n")
+        self.assertEqual(format_transcript(""), "")
 
 
 if __name__ == "__main__":

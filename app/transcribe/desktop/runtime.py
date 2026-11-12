@@ -5,7 +5,9 @@ from __future__ import annotations
 import queue
 import threading
 
-from .. import interactions
+import datetime
+import os
+
 from ..audio_player import AudioPlayer
 from ..db.app_db import AppDB
 from ..providers.llm import create_responder
@@ -91,8 +93,7 @@ def initiate_app_threads(runtime, config: dict):
         response_file_name=llm_response_file,
     )
     if runtime.responder is None:
-        print(f"FATAL: Could not create Chat Reponder for {chat}")
-        raise SystemExit(1)
+        raise RuntimeError(f'Unknown chat_inference_provider "{chat}" in the settings (use openai or together).')
     runtime.responder.enabled = bool(config["General"]["continuous_response"])
     threading.Thread(target=runtime.responder.warm_up, name="ResponderWarmUp", daemon=True).start()
 
@@ -111,13 +112,6 @@ def initiate_app_threads(runtime, config: dict):
         daemon=True,
     )
     audio_response_thread.start()
-
-    host_config_thread = threading.Thread(
-        target=interactions.HostConfig(runtime).host_config_loop,
-        name="HostConfig",
-        daemon=True,
-    )
-    host_config_thread.start()
 
     clear_transcript_thread = threading.Thread(
         target=runtime.transcriber.clear_transcript_data_loop,
@@ -142,15 +136,41 @@ def initiate_db(runtime):
     adb.initialize_app()
 
 
+def save_transcript_copy(runtime) -> str | None:
+    """Write the session's transcript to the transcripts folder. Returns the file name, or None
+    when nothing was said."""
+    from .services import format_transcript  # pylint: disable=import-outside-toplevel
+    if runtime.transcriber is None:
+        return None
+    text = format_transcript(runtime.transcriber.get_transcript())
+    if not text.strip():
+        return None
+    folder = os.path.join(utilities.get_data_path(app_name="Transcribe"), "logs", "transcripts")
+    os.makedirs(folder, exist_ok=True)
+    filename = os.path.join(folder, f"transcript-{datetime.datetime.now():%Y-%m-%d-%H%M%S}.txt")
+    with open(filename, mode="w", encoding="utf-8") as file_handle:
+        file_handle.write(text)
+    return filename
+
+
 def shutdown(runtime):
-    """Activities to be performed right before application shutdown."""
+    """Activities to be performed right before application shutdown. Each step is on its own:
+    a failing one must not keep the others (above all saving the transcript) from running."""
+    def step(name, action):
+        try:
+            action()
+        except Exception as exception:  # pylint: disable=broad-except
+            print(f"[WARN] Shutdown step '{name}' failed: {exception}")
+
+    step("save transcript", lambda: save_transcript_copy(runtime))
     if runtime.transcriber is not None:
-        runtime.transcriber.stop()
+        step("stop transcriber", runtime.transcriber.stop)
     if runtime.device_watcher is not None:
-        runtime.device_watcher.stop()
+        step("stop device watcher", runtime.device_watcher.stop)
     for recorder in (runtime.user_audio_recorder, runtime.speaker_audio_recorder):
-        if recorder is not None and recorder.stop_record_func is not None:
-            recorder.stop_record_func(wait_for_stop=True)
-    runtime.user_audio_recorder.write_wav_data_to_file()
-    runtime.speaker_audio_recorder.write_wav_data_to_file()
-    AppDB().shutdown_app()
+        if recorder is None:
+            continue
+        if recorder.stop_record_func is not None:
+            step("stop capture", lambda recorder=recorder: recorder.stop_record_func(wait_for_stop=True))
+        step("write recording", recorder.write_wav_data_to_file)
+    step("close database", lambda: AppDB().shutdown_app())

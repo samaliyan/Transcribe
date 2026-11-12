@@ -37,8 +37,12 @@ from tsutils import duration, language
 
 
 # pylint: disable=logging-fstring-interpolation
-# A gap longer than this between two captured phrases of one source starts a new row.
+# With untranscribed audio waiting, a source's worker finishes the phrase after this long.
 PHRASE_TIMEOUT = 3.05
+# Silence longer than this between two captured pieces of one source starts a new row. (Measured
+# from the end of one piece to the start of the next: pieces of unbroken speech are cut every
+# transcript_audio_duration_seconds and must stay in one row.)
+NEW_ROW_SILENCE_SECONDS = 2.0
 DEFAULT_COMMIT_SECONDS = 10.0
 # Never cut off less audio than this when committing; tiny cuts are not worth a new row.
 MIN_COMMIT_CUT_SECONDS = 1.0
@@ -82,6 +86,8 @@ class AudioTranscriber(TranscriberInterface):   # pylint: disable=C0115, R0902
         # once; network engines and faster-whisper (two workers) can.
         self._model_lock = threading.Lock()
         self.conversation = convo
+        # Why speech to text is failing right now (None: it works). The window shows it.
+        self.last_error: str | None = None
 
     def _new_source_state(self) -> dict:
         return {
@@ -164,7 +170,7 @@ class AudioTranscriber(TranscriberInterface):   # pylint: disable=C0115, R0902
                     break
             generation = self._generation
             for data, time_spoken in items:
-                if self._is_new_phrase(source_info, time_spoken) and source_info["dirty"]:
+                if self._is_new_phrase(source_info, time_spoken, data) and source_info["dirty"]:
                     # Finish the previous phrase before its audio is replaced by the next one.
                     self._run_safely(who_spoke)
                 if not self._update_last_sample_and_phrase_status(who_spoke, data, time_spoken, generation):
@@ -175,8 +181,10 @@ class AudioTranscriber(TranscriberInterface):   # pylint: disable=C0115, R0902
     def _run_safely(self, who_spoke: str):
         try:
             self._transcribe_source(who_spoke)
+            self.last_error = None
         except Exception as exception:  # a worker must never die: the source would go silent
             logger.exception(f'Transcription failed for {who_spoke}: {exception}')
+            self.last_error = describe_stt_error(exception)
             with self.mutex:
                 self.audio_sources_properties[who_spoke]["dirty"] = False
 
@@ -184,10 +192,12 @@ class AudioTranscriber(TranscriberInterface):   # pylint: disable=C0115, R0902
     # Buffer handling
     # ----------------------------------------------------------------------------------------
     @staticmethod
-    def _is_new_phrase(source_info: dict, time_spoken) -> bool:
+    def _is_new_phrase(source_info: dict, time_spoken, data: bytes = b"") -> bool:
         last_spoken = source_info["last_spoken"]
-        return last_spoken is None or \
-            time_spoken - last_spoken > datetime.timedelta(seconds=PHRASE_TIMEOUT)
+        if last_spoken is None:
+            return True
+        started = time_spoken - datetime.timedelta(seconds=len(data) / audio_format.BYTES_PER_SECOND)
+        return started - last_spoken > datetime.timedelta(seconds=NEW_ROW_SILENCE_SECONDS)
 
     def _update_last_sample_and_phrase_status(self, who_spoke, data, time_spoken, generation=None) -> bool:
         """Add captured audio to the source's buffer. False when a clear happened since `generation`."""
@@ -198,7 +208,7 @@ class AudioTranscriber(TranscriberInterface):   # pylint: disable=C0115, R0902
                 return False
             if not self.transcribe:
                 return True
-            if self._is_new_phrase(source_info, time_spoken):
+            if self._is_new_phrase(source_info, time_spoken, data):
                 source_info["last_sample"] = bytes()
                 source_info["buffer_start_seconds"] = 0.0
                 source_info["new_phrase"] = True
@@ -394,16 +404,39 @@ class AudioTranscriber(TranscriberInterface):   # pylint: disable=C0115, R0902
         self.conversation.clear_conversation_data()
 
 
+# Names people type, and codes the speech to text engines spell differently from the table.
+_LANGUAGE_ALIASES = {"farsi": "fa", "iw": "he", "hebrew": "he", "mandarin": "zh", "jw": "jv"}
+
+
 def language_code(lang: str) -> str:
-    """'English' / 'english' / 'en' -> 'en' (unknown names are passed on unchanged)."""
-    value = str(lang or "").strip()
-    lowered = value.lower()
+    """'English' / 'english' / 'en' -> 'en'. An unknown name gives '' (the engine detects the
+    language itself) instead of a value every request would fail on."""
+    lowered = str(lang or "").strip().lower()
+    if lowered in _LANGUAGE_ALIASES:
+        return _LANGUAGE_ALIASES[lowered]
     if lowered in language.LANGUAGES_DICT:
         return lowered
     for code, name in language.LANGUAGES_DICT.items():
         if name == lowered:
-            return code
-    return value
+            return _LANGUAGE_ALIASES.get(code, code)
+    if lowered:
+        logger.warning(f'Unknown audio language "{lang}": the engine will detect the language')
+    return ""
+
+
+def describe_stt_error(exception: Exception) -> str:
+    """One sentence for the user about why speech to text failed."""
+    name = type(exception).__name__
+    text = " ".join(str(exception).split())
+    if name == "AuthenticationError" or "401" in text[:40]:
+        return "Speech to text: the API key was rejected. Check it in Settings."
+    if name in ("APIConnectionError", "APITimeoutError", "ConnectError", "ReadTimeout") or "timed out" in text.lower():
+        return "Speech to text: the online service could not be reached. Check the internet connection (or VPN)."
+    if name == "RateLimitError":
+        return "Speech to text: the online service is refusing requests (rate limit or no credit left)."
+    if len(text) > 260:
+        text = text[:259] + "…"
+    return text if text.lower().startswith(("speech to text", "the local speech")) else f"Speech to text failed: {text}"
 
 
 class WhisperTranscriber(AudioTranscriber):

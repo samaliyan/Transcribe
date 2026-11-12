@@ -350,6 +350,19 @@ class SenseVoiceSTTModel(STTModelInterface):
             for segment in response["segments"]
         ]
 
+LOAD_RETRY_SECONDS = 30
+# Used when Hugging Face itself cannot be reached (it is blocked or slow in some countries).
+MODEL_DOWNLOAD_MIRROR = "https://hf-mirror.com"
+_MODEL_FILES = ["config.json", "preprocessor_config.json", "model.bin", "tokenizer.json", "vocabulary.*"]
+
+
+def bundled_model_dir(model: str) -> str | None:
+    """A model shipped next to Transcribe.exe (models/faster-whisper-<name>), if there is one."""
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.getcwd()
+    folder = os.path.join(base, "models", f"faster-whisper-{model}")
+    return folder if os.path.isfile(os.path.join(folder, "model.bin")) else None
+
+
 class WhisperSTTModel(STTModelInterface):
     """Speech to Text with a local Whisper model.
 
@@ -357,6 +370,8 @@ class WhisperSTTModel(STTModelInterface):
     on a CPU, and it does not need PyTorch. openai-whisper is optional and used only when
     ``General.local_engine`` chooses it (or when it is the only engine installed).
     """
+    use_vad = True
+
     def __init__(self, stt_model_config: dict, background: bool = False):
         self.model = stt_model_config['local_transcripton_model_file']
         self.lang = stt_model_config['audio_lang']
@@ -379,12 +394,17 @@ class WhisperSTTModel(STTModelInterface):
             self._load()
 
     def _load_in_background(self):
-        try:
-            self._load()
-        except Exception as exception:  # pylint: disable=broad-except
-            self.load_state = str(exception)
-            self._loaded.set()
-            print(f'[ERROR] {exception}')
+        """Load the model; if that fails (typically: the first download without internet), say
+        why and keep trying, so the program recovers by itself once the connection is back."""
+        while True:
+            try:
+                self._load()
+                return
+            except Exception as exception:  # pylint: disable=broad-except
+                self.load_state = str(exception)
+                self._loaded.set()      # requests fail with this reason instead of waiting
+                print(f'[ERROR] {exception}')
+            time.sleep(LOAD_RETRY_SECONDS)
 
     def _load(self):
         started = time.monotonic()
@@ -395,8 +415,8 @@ class WhisperSTTModel(STTModelInterface):
                 if not _installed("whisper"):
                     raise RuntimeError(
                         f'The local speech to text model "{self.model}" could not be loaded ({exception}). '
-                        'The first start downloads it from Hugging Face: check the internet connection '
-                        'or proxy and start again.') from exception
+                        'It is downloaded from Hugging Face the first time it is used: check the internet '
+                        'connection (or set a proxy in Settings > General).') from exception
                 # openai-whisper is installed too (optional): use it and its .pt file instead
                 print(f'[WARN] faster-whisper could not load model {self.model} ({exception}); '
                       'using openai-whisper instead.')
@@ -435,6 +455,10 @@ class WhisperSTTModel(STTModelInterface):
         utilities.ensure_directory_exists(download_root)
 
         def build(device, compute_type):
+            # The model shipped with the program needs no download at all.
+            bundled = bundled_model_dir(self.model)
+            if bundled is not None:
+                return WhisperModel(bundled, device=device, compute_type=compute_type, num_workers=2)
             # A model that is already on disk is opened without asking Hugging Face first:
             # that check went over the internet at every start and could take minutes where
             # the site is slow or blocked. Only a missing model is downloaded.
@@ -442,9 +466,20 @@ class WhisperSTTModel(STTModelInterface):
                 return WhisperModel(self.model, device=device, compute_type=compute_type,
                                     download_root=download_root, num_workers=2, local_files_only=True)
             except Exception:  # pylint: disable=broad-except
-                print(f'[INFO] Downloading the speech to text model "{self.model}" (first start only)...')
+                pass
+            print(f'[INFO] Downloading the speech to text model "{self.model}" (first use only)...')
+            self.load_state = "downloading"
+            try:
                 return WhisperModel(self.model, device=device, compute_type=compute_type,
                                     download_root=download_root, num_workers=2)
+            except Exception as exception:  # pylint: disable=broad-except
+                print(f'[WARN] Download from Hugging Face failed ({exception}); trying {MODEL_DOWNLOAD_MIRROR}')
+                try:
+                    path = self._download_from_mirror(download_root)
+                except Exception as mirror_exception:  # pylint: disable=broad-except
+                    print(f'[WARN] Download from the mirror failed too ({mirror_exception}).')
+                    raise exception from mirror_exception
+                return WhisperModel(path, device=device, compute_type=compute_type, num_workers=2)
 
         if allow_gpu:
             try:
@@ -459,6 +494,14 @@ class WhisperSTTModel(STTModelInterface):
         model = build("cpu", "int8")
         self.use_gpu = False
         return model
+
+    def _download_from_mirror(self, download_root: str) -> str:
+        """Download the model files from the mirror into the same cache; returns their folder."""
+        import huggingface_hub  # pylint: disable=import-outside-toplevel
+        from faster_whisper import utils as fw_utils  # pylint: disable=import-outside-toplevel
+        repo_id = getattr(fw_utils, "_MODELS", {}).get(self.model, self.model)
+        return huggingface_hub.snapshot_download(
+            repo_id, cache_dir=download_root, endpoint=MODEL_DOWNLOAD_MIRROR, allow_patterns=_MODEL_FILES)
 
     def download_model(self):
         """Download the appropriate OpenAI model if needed"""
@@ -499,14 +542,21 @@ class WhisperSTTModel(STTModelInterface):
     def _transcribe(self, audio) -> dict:
         """Transcribe a file path or a 16 kHz float32 array into openai-whisper's result shape."""
         self._loaded.wait()
+        if self.load_state in ("loading", "downloading"):
+            raise RuntimeError("The speech to text model is still being downloaded.")
         if self.load_state != "ready":
-            raise RuntimeError(self.load_state)
+            raise RuntimeError(self.load_state)      # (the reason, worded for the user)
         language = self.lang or None
         if self.engine == FASTER_WHISPER:
             model = self.audio_model
             try:
                 return self._faster_whisper_transcribe(model, audio, language)
-            except Exception:  # pylint: disable=broad-except
+            except Exception as exception:  # pylint: disable=broad-except
+                if WhisperSTTModel.use_vad and any(word in str(exception).lower() for word in ("onnx", "silero", "vad")):
+                    # The voice activity filter cannot run here: go on without it.
+                    print(f'[WARN] Voice activity filter is off ({exception}).')
+                    WhisperSTTModel.use_vad = False
+                    return self._transcribe(audio)
                 if model is not getattr(self, "_gpu_model", None):
                     raise
                 # The GPU was found but its CUDA libraries (cuBLAS / cuDNN) are missing: this
@@ -545,9 +595,11 @@ class WhisperSTTModel(STTModelInterface):
 
     @staticmethod
     def _faster_whisper_transcribe(model, audio, language) -> dict:
+        # vad_filter: parts without speech (noise, music, a pause) are not given to the model,
+        # which otherwise tends to invent text for them. Timestamps stay those of the audio.
         segments, info = model.transcribe(
             audio, language=language, beam_size=1, temperature=0,
-            condition_on_previous_text=False)
+            condition_on_previous_text=False, vad_filter=WhisperSTTModel.use_vad)
         items = [{"id": index, "start": float(segment.start), "end": float(segment.end),
                   "text": segment.text} for index, segment in enumerate(segments)]
         return {"text": "".join(item["text"] for item in items).strip(),
@@ -557,12 +609,8 @@ class WhisperSTTModel(STTModelInterface):
         """Both engines take a 16 kHz float32 array directly: no file and no ffmpeg."""
         if sample_rate != audio_format.TARGET_SAMPLE_RATE:
             return super().transcribe_pcm(pcm, sample_rate)
-        try:
-            return self._transcribe(audio_format.pcm16_to_float32(pcm))
-        except Exception as exception:
-            print('WhisperSTTModel:transcribe_pcm - Encountered error')
-            print(exception)
-            return ''
+        # Errors go to the caller: the live transcriber shows them to the user.
+        return self._transcribe(audio_format.pcm16_to_float32(pcm))
 
     def set_lang(self, lang: str):
         """Set Language for STT (the same model serves every language)."""
@@ -618,7 +666,9 @@ class APIWhisperSTTModel(STTModelInterface):
             raise Exception("Attempt to create Open AI Whisper STT Model without an api key.")  # pylint: disable=W0719
         print('[INFO] Using Open AI Whisper API for transcription.')
         # One retry at most: a live request that is retried for long only holds back newer audio.
-        self.stt_client = openai.OpenAI(api_key=stt_model_config['api_key'], base_url=None, max_retries=1)
+        # The same Base URL as the replies: an OpenAI-compatible provider can serve both.
+        self.stt_client = openai.OpenAI(api_key=stt_model_config['api_key'],
+                                        base_url=stt_model_config.get('base_url') or None, max_retries=1)
         self.timeout = stt_model_config['timeout']
         self.model = stt_model_config.get('model') or 'whisper-1'
         # lang parameter is not required for API invocation. This exists solely
@@ -655,12 +705,8 @@ class APIWhisperSTTModel(STTModelInterface):
 
     def transcribe_pcm(self, pcm: bytes, sample_rate: int = audio_format.TARGET_SAMPLE_RATE):
         """Upload 16 kHz mono WAV straight from memory."""
-        try:
-            return self._request(("audio.wav", audio_format.pcm16_to_wav_bytes(pcm, sample_rate), "audio/wav"))
-        except Exception as exception:
-            print('Exception in transcribing audio using whisper API.')
-            print(exception)
-            return ''
+        # Errors go to the caller: the live transcriber shows them to the user.
+        return self._request(("audio.wav", audio_format.pcm16_to_wav_bytes(pcm, sample_rate), "audio/wav"))
 
     def process_response(self, response) -> str:
         """
@@ -861,13 +907,15 @@ class DeepgramSTTModel(STTModelInterface):
 
     def _transcribe_buffer(self, buffer_data: bytes):
         from deepgram import PrerecordedOptions  # pylint: disable=import-outside-toplevel
+        # The chosen language is sent; detection per short request could change language mid-talk.
+        language_options = {"language": self.lang} if self.lang else {"detect_language": True}
         options = PrerecordedOptions(
             model=self.model,
             smart_format=True,
             utterances=True,
             punctuate=True,
             paragraphs=True,
-            detect_language=True)
+            **language_options)
         return self.audio_model.listen.prerecorded.v("1").transcribe_file({"buffer": buffer_data}, options)
 
     def get_transcription(self, wav_file_path: str):
@@ -882,11 +930,8 @@ class DeepgramSTTModel(STTModelInterface):
 
     def transcribe_pcm(self, pcm: bytes, sample_rate: int = audio_format.TARGET_SAMPLE_RATE):
         """Send the WAV from memory (no file, and no debug copy of every response on disk)."""
-        try:
-            return self._transcribe_buffer(audio_format.pcm16_to_wav_bytes(pcm, sample_rate))
-        except Exception as exception:
-            print(exception)
-        return None
+        # Errors go to the caller: the live transcriber shows them to the user.
+        return self._transcribe_buffer(audio_format.pcm16_to_wav_bytes(pcm, sample_rate))
 
     def get_sentences(self, wav_file_path: str):
         """Get transcription from the provided audio file as individual sentences
